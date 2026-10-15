@@ -582,6 +582,10 @@
                   <label>每个 Key Tier 最大尝试次数</label><input id="c-attempts" type="number" />
                 </div>
                 <div class="field">
+                  <label>代理池匿名最大尝试次数（0 = 每个代理一次）</label>
+                  <input id="c-anonymous-attempts" type="number" min="0" />
+                </div>
+                <div class="field">
                   <label>请求超时（秒）</label><input id="c-timeout" type="number" />
                 </div>
                 <div class="field">
@@ -641,6 +645,9 @@
               <div class="form-grid">
                 <div class="field">
                   <label>Max Idle Conns</label><input id="c-idle" type="number" />
+                </div>
+                <div class="field full">
+                  <label class="check-label"><input id="c-disable-proxy-keep-alives" type="checkbox" />代理请求每次使用新连接（配合匿名重试用于轮换出口代理池）</label>
                 </div>
                 <div class="field">
                   <label>Max Idle / Host</label><input id="c-idle-host" type="number" />

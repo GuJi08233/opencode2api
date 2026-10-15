@@ -86,7 +86,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 		transports:     transports,
 		zenNodes:       zenNodes,
 		goNodes:        goNodes,
-		anonymous:      newAnonymousPool(cfg.Anonymous, transports, cooldown),
+		anonymous:      newAnonymousPool(cfg.Anonymous, transports, cooldown, cfg.Retry.AnonymousMaxAttempts > 0),
 		catalog:        catalog,
 		monitor:        monitor,
 		attemptTimeout: attemptDeadline(cfg),

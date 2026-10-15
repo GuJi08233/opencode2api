@@ -61,8 +61,9 @@ type UpstreamConfig struct {
 }
 
 type RetryConfig struct {
-	MaxAttempts    int `json:"max_attempts"`
-	TimeoutSeconds int `json:"timeout_seconds"`
+	MaxAttempts          int `json:"max_attempts"`
+	AnonymousMaxAttempts int `json:"anonymous_max_attempts"`
+	TimeoutSeconds       int `json:"timeout_seconds"`
 }
 
 type ModelsConfig struct {
@@ -92,14 +93,15 @@ type WebUIConfig struct {
 }
 
 type PerformanceConfig struct {
-	MaxIdleConns             int `json:"max_idle_conns"`
-	MaxIdleConnsPerHost      int `json:"max_idle_conns_per_host"`
-	MaxConnsPerHost          int `json:"max_conns_per_host"`
-	IdleConnTimeoutSeconds   int `json:"idle_conn_timeout_seconds"`
-	ConnectTimeoutSeconds    int `json:"connect_timeout_seconds"`
-	FailureCooldownSeconds   int `json:"failure_cooldown_seconds"`
-	AttemptTimeoutSeconds    int `json:"attempt_timeout_seconds"`
-	FirstEventTimeoutSeconds int `json:"first_event_timeout_seconds"`
+	DisableProxyKeepAlives   bool `json:"disable_proxy_keep_alives"`
+	MaxIdleConns             int  `json:"max_idle_conns"`
+	MaxIdleConnsPerHost      int  `json:"max_idle_conns_per_host"`
+	MaxConnsPerHost          int  `json:"max_conns_per_host"`
+	IdleConnTimeoutSeconds   int  `json:"idle_conn_timeout_seconds"`
+	ConnectTimeoutSeconds    int  `json:"connect_timeout_seconds"`
+	FailureCooldownSeconds   int  `json:"failure_cooldown_seconds"`
+	AttemptTimeoutSeconds    int  `json:"attempt_timeout_seconds"`
+	FirstEventTimeoutSeconds int  `json:"first_event_timeout_seconds"`
 }
 
 // AttemptTimeout bounds how long a single upstream attempt may wait for
@@ -199,6 +201,12 @@ func Normalize(path string, cfg Config) (Config, error) {
 	}
 	if cfg.Retry.MaxAttempts < 1 {
 		return Config{}, errors.New("retry.max_attempts must be at least 1")
+	}
+	if cfg.Retry.AnonymousMaxAttempts < 0 {
+		return Config{}, errors.New("retry.anonymous_max_attempts must not be negative")
+	}
+	if cfg.Retry.AnonymousMaxAttempts > 0 && !cfg.Performance.DisableProxyKeepAlives {
+		return Config{}, errors.New("retry.anonymous_max_attempts requires performance.disable_proxy_keep_alives for rotating proxy gateways")
 	}
 	if cfg.Retry.TimeoutSeconds < 1 {
 		return Config{}, errors.New("retry.timeout_seconds must be at least 1")

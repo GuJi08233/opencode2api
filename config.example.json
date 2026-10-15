@@ -13,6 +13,7 @@
   },
   "retry": {
     "max_attempts": 3,
+    "anonymous_max_attempts": 0,
     "timeout_seconds": 300
   },
   "models": {
@@ -21,6 +22,7 @@
     "free_only": false
   },
   "performance": {
+    "disable_proxy_keep_alives": false,
     "max_idle_conns": 2048,
     "max_idle_conns_per_host": 256,
     "max_conns_per_host": 0,

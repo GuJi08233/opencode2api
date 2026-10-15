@@ -2,6 +2,8 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
+这是 [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api) 的 Fork，新增单入口轮换代理池的新连接与匿名重试支持。镜像由本仓库的 GitHub Actions 发布到 `ghcr.io/guji08233/opencode2api`。
+
 使用 Go 编写的 **OpenCode Zen / Zen Go API 网关**。对外提供 Chat Completions、Responses 和 Anthropic Messages 接口，按上游原生协议转换请求，并统一管理上游 Key 与代理。
 
 WebUI 内嵌在可执行文件中，运行服务无需 Node.js 或数据库。
@@ -24,10 +26,10 @@ WebUI 内嵌在可执行文件中，运行服务无需 Node.js 或数据库。
 
 ## 快速开始
 
-从 [GitHub Releases](https://github.com/jasonxu114514/opencode2api/releases) 下载可执行文件，或使用 **Go 1.24 及以上版本**编译：
+从 [GitHub Releases](https://github.com/GuJi08233/opencode2api/releases) 下载可执行文件，或使用 **Go 1.24 及以上版本**编译：
 
 ```bash
-git clone https://github.com/jasonxu114514/opencode2api.git
+git clone https://github.com/GuJi08233/opencode2api.git
 cd opencode2api
 cp config.example.json config.json
 go build -o opencode2api ./cmd/opencode2api
@@ -59,7 +61,7 @@ Windows 下使用 `Copy-Item config.example.json config.json` 复制配置，执
 
 ## Docker 部署
 
-已发布镜像：`ghcr.io/jasonxu114514/opencode2api`。
+已发布镜像：`ghcr.io/guji08233/opencode2api`，支持 `linux/amd64` 和 `linux/arm64`。发行标签固定版本，`latest` 跟随本 Fork 的最新正式发行。
 
 ```bash
 cp config.example.json config.json
@@ -103,6 +105,24 @@ docker run -d --name opencode2api \
 ```
 
 在 Docker 中使用 `proxyfile` 时，代理文件也需要挂载到容器内配置指定的位置。
+
+### 单入口轮换代理池（例如 Resin）
+
+在现有配置中合并以下选项，代理凭据按实际设置填写：
+
+```json
+{
+  "proxies": ["socks5h://USER:PASSWORD@resin:2260"],
+  "retry": {"max_attempts": 3, "anonymous_max_attempts": 3, "timeout_seconds": 300},
+  "performance": {"disable_proxy_keep_alives": true, "attempt_timeout_seconds": 20}
+}
+```
+
+`disable_proxy_keep_alives: true` 让每次代理请求（包括每次重试）使用新的连接，并关闭这些连接上的 HTTP/2 复用；`direct` 连接仍可复用。它只保证新连接，是否切换出口 IP、是否保持粘性会话由代理池决定。
+
+`anonymous_max_attempts` 大于 0 时限制匿名阶段的总尝试次数，包含首次请求，并允许再次连接同一个代理池入口。网络错误、401/403、429 和 5xx 可以重试；其他 4xx 立即结束匿名阶段。一次出口失败不会将整个轮换入口置于冷却或标记为不可用；所有尝试仍受请求总超时约束。这个模式要求同时开启 `disable_proxy_keep_alives`。
+
+默认值为 `false` 和 `0`，保留原项目的连接池与匿名代理冷却行为。直连出口仍最多尝试一次。配置中心也可编辑这两个选项，保存后热重载生效。已交付客户端的流式响应不会被重放。
 
 ## API 调用
 
@@ -211,7 +231,7 @@ System One 将自由文本状态与类型化问题配对，并返回类型化答
 
 路由顺序：
 
-1. 符合条件的模型先尝试匿名通道，每个可用代理最多一次。
+1. 符合条件的模型先尝试匿名通道，默认每个可用代理最多一次；启用上述代理池模式时使用 `retry.anonymous_max_attempts` 预算。
 2. 按 `prefer` 顺序尝试认证通道，仅包含已配置 Key 且可以提供该模型的 Tier。
 3. 每个认证 Tier 分别使用 `retry.max_attempts` 预算。
 
@@ -316,7 +336,9 @@ direct
 | 字段                                    | 默认值 | 含义                                             |
 | --------------------------------------- | ------ | ------------------------------------------------ |
 | `retry.max_attempts`                    | `3`    | 每个认证 Tier 的尝试次数，包含首次请求。         |
+| `retry.anonymous_max_attempts`          | `0`    | 0 保留每个代理一次；大于 0 为轮换代理池匿名尝试总数，包含首次，需开启代理新连接。 |
 | `retry.timeout_seconds`                 | `300`  | 推理请求总超时，包含流式响应读取。               |
+| `performance.disable_proxy_keep_alives` | `false` | 每次代理请求使用新连接并禁用 HTTP/2 复用，直连不受影响。 |
 | `performance.attempt_timeout_seconds`   | `0`    | 单次尝试的总超时；0 表示使用请求总超时。         |
 | `performance.connect_timeout_seconds`   | `5`    | 建立连接的超时。                                 |
 | `performance.failure_cooldown_seconds`  | `15`   | 失败冷却基数。                                   |

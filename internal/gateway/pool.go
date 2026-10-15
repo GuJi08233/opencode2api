@@ -22,11 +22,13 @@ import (
 )
 
 type proxyTransport struct {
-	index    int
-	name     string
-	client   *http.Client
-	healthy  atomic.Bool
-	checking atomic.Bool
+	index  int
+	name   string
+	client *http.Client
+	// A fresh proxy connection lets a rotating gateway select a new exit.
+	freshConnections bool
+	healthy          atomic.Bool
+	checking         atomic.Bool
 }
 
 type transportPool struct {
@@ -40,6 +42,7 @@ type anonymousPool struct {
 	nodes    []*anonymousNode
 	next     atomic.Uint64
 	cooldown time.Duration
+	rotating bool
 }
 
 type anonymousNode struct {
@@ -54,8 +57,8 @@ type anonymousCursor struct {
 	offset int
 }
 
-func newAnonymousPool(enabled bool, transports *transportPool, cooldown time.Duration) *anonymousPool {
-	pool := &anonymousPool{cooldown: cooldown}
+func newAnonymousPool(enabled bool, transports *transportPool, cooldown time.Duration, rotating bool) *anonymousPool {
+	pool := &anonymousPool{cooldown: cooldown, rotating: rotating}
 	if !enabled || transports == nil {
 		return pool
 	}
@@ -88,15 +91,20 @@ func (p *anonymousPool) CursorFor(affinity string) anonymousCursor {
 	return anonymousCursor{pool: p, start: start}
 }
 
-// Next visits each healthy, non-cooling proxy at most once per cursor.
+// Fixed exits are visited at most once. Rotating gateways may be revisited
+// within the caller's attempt budget; each visit creates a fresh connection.
 func (c *anonymousCursor) Next() *anonymousNode {
 	if c.pool == nil || len(c.pool.nodes) == 0 {
 		return nil
 	}
 	now := time.Now().UnixNano()
-	for c.offset < len(c.pool.nodes) {
+	for scanned := 0; scanned < len(c.pool.nodes); scanned++ {
 		node := c.pool.nodes[(c.start+c.offset)%len(c.pool.nodes)]
+		revisited := c.offset >= len(c.pool.nodes)
 		c.offset++
+		if revisited && (!c.pool.rotating || !node.proxy.freshConnections) {
+			continue
+		}
 		if node.proxy.healthy.Load() && node.cooldownUntil.Load() <= now {
 			return node
 		}
@@ -146,6 +154,11 @@ const maxAnonymousRetryAfterMultiplier = 8
 
 func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, err error) {
 	if node == nil {
+		return
+	}
+	// One exit's quota or network failure must not cool down every exit behind
+	// the same gateway. The request's finite attempt/timeout budget bounds retries.
+	if p.rotating && node.proxy.freshConnections {
 		return
 	}
 	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
@@ -206,6 +219,15 @@ func newTransportPool(proxies []string, cfg config.PerformanceConfig, responseHe
 			transport.Proxy = http.ProxyURL(u)
 		}
 		proxy := &proxyTransport{index: len(p.items), name: raw, client: &http.Client{Transport: transport}}
+		if raw != "direct" && cfg.DisableProxyKeepAlives {
+			transport.DisableKeepAlives = true
+			// HTTP/2 multiplexing would otherwise keep multiple requests on one
+			// proxy tunnel. Restrict this mode to one HTTP/1.1 request per connection.
+			transport.ForceAttemptHTTP2 = false
+			transport.Protocols = new(http.Protocols)
+			transport.Protocols.SetHTTP1(true)
+			proxy.freshConnections = true
+		}
 		proxy.healthy.Store(true)
 		p.items = append(p.items, proxy)
 	}

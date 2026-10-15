@@ -2,6 +2,8 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
+This fork of [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api) adds fresh connections and anonymous retries for rotating proxy gateways. GitHub Actions publishes this fork's images to `ghcr.io/guji08233/opencode2api`.
+
 A Go gateway for **OpenCode Zen and Zen Go**. It exposes Chat Completions, Responses, and Anthropic Messages endpoints, translates between their native protocols, and manages upstream keys and proxies.
 
 The executable includes the WebUI. Running the service requires no Node.js runtime or database.
@@ -24,10 +26,10 @@ See the [management console guide (Chinese)](docs/management.zh-CN.md) for the n
 
 ## Quick start
 
-Download a binary from [GitHub Releases](https://github.com/jasonxu114514/opencode2api/releases), or build with **Go 1.24 or newer**:
+Download a binary from [GitHub Releases](https://github.com/GuJi08233/opencode2api/releases), or build with **Go 1.24 or newer**:
 
 ```bash
-git clone https://github.com/jasonxu114514/opencode2api.git
+git clone https://github.com/GuJi08233/opencode2api.git
 cd opencode2api
 cp config.example.json config.json
 go build -o opencode2api ./cmd/opencode2api
@@ -59,7 +61,7 @@ The configuration directory must be writable for password migration, configurati
 
 ## Docker
 
-The published image is `ghcr.io/jasonxu114514/opencode2api`.
+The published image is `ghcr.io/guji08233/opencode2api`, with `linux/amd64` and `linux/arm64` support. Release tags pin a version; `latest` follows this fork's latest stable release.
 
 ```bash
 cp config.example.json config.json
@@ -103,6 +105,24 @@ docker run -d --name opencode2api \
 ```
 
 A `proxyfile` used in Docker must also be available inside the container at the configured path.
+
+### Rotating proxy gateways (such as Resin)
+
+Merge these options into your existing configuration, using your proxy credentials:
+
+```json
+{
+  "proxies": ["socks5h://USER:PASSWORD@resin:2260"],
+  "retry": {"max_attempts": 3, "anonymous_max_attempts": 3, "timeout_seconds": 300},
+  "performance": {"disable_proxy_keep_alives": true, "attempt_timeout_seconds": 20}
+}
+```
+
+`disable_proxy_keep_alives: true` opens a fresh connection for each proxied request and retry, disabling HTTP/2 multiplexing on those connections. Direct connections retain pooling. A fresh connection gives the proxy a chance to select another exit; exit rotation and session stickiness remain the proxy's responsibility.
+
+A positive `anonymous_max_attempts` bounds total anonymous attempts, including the first, and allows reconnecting to the same rotating proxy gateway. Transport errors, 401/403, 429, and 5xx can be retried; other 4xx responses end the anonymous phase. An individual exit failure does not cool down or mark the whole rotating entry unhealthy. All attempts share the request timeout. This mode requires `disable_proxy_keep_alives`.
+
+Defaults of `false` and `0` preserve upstream pooling and anonymous cooldowns. Direct exits are still tried at most once. Both options are available in the WebUI configuration center and support hot reload. Streams already delivered downstream are never replayed.
 
 ## API usage
 
@@ -211,7 +231,7 @@ Eligibility is a routing decision; the upstream can still reject or rate-limit t
 
 The routing sequence is:
 
-1. For an eligible model, try each available anonymous proxy once.
+1. For an eligible model, try each available anonymous proxy once by default. Rotating gateway mode uses the `retry.anonymous_max_attempts` budget described above.
 2. Try authenticated tiers in `prefer` order, using only tiers with a configured key and a route for that model.
 3. Apply `retry.max_attempts` separately to each authenticated tier.
 
@@ -321,7 +341,9 @@ Comment markers are `#`, `;`, and `//` at the start of a line or after whitespac
 | Field                                   | Default | Meaning                                                |
 | --------------------------------------- | ------- | ------------------------------------------------------ |
 | `retry.max_attempts`                    | `3`     | Attempts per authenticated tier, including the first.  |
+| `retry.anonymous_max_attempts`          | `0`     | 0 visits each proxy once; positive values bound rotating-gateway anonymous attempts, including the first, and require fresh proxy connections. |
 | `retry.timeout_seconds`                 | `300`   | Total inference timeout, including stream consumption. |
+| `performance.disable_proxy_keep_alives` | `false` | Fresh connections for proxy requests, without HTTP/2 multiplexing; direct requests retain pooling. |
 | `performance.attempt_timeout_seconds`   | `0`     | Whole-attempt bound; 0 uses the request timeout.       |
 | `performance.connect_timeout_seconds`   | `5`     | Connection establishment timeout.                      |
 | `performance.failure_cooldown_seconds`  | `15`    | Base failure cooldown.                                 |

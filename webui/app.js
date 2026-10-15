@@ -146,6 +146,7 @@ function fillConfig(value) {
   $("#c-up-zen").value = value.upstream.zen;
   $("#c-up-go").value = value.upstream.go;
   $("#c-attempts").value = value.retry.max_attempts;
+  $("#c-anonymous-attempts").value = value.retry.anonymous_max_attempts || 0;
   $("#c-timeout").value = value.retry.timeout_seconds;
   $("#c-refresh").value = value.models.refresh_seconds;
   $("#c-protocols").value = JSON.stringify(value.models.protocols || {}, null, 2);
@@ -154,6 +155,7 @@ function fillConfig(value) {
   $("#c-reasoning-effort").value = reasoning.effort || "";
   $("#c-reasoning-by-model").value = JSON.stringify(reasoning.effort_by_model || {}, null, 2);
   $("#c-idle").value = value.performance.max_idle_conns;
+  $("#c-disable-proxy-keep-alives").checked = !!value.performance.disable_proxy_keep_alives;
   $("#c-idle-host").value = value.performance.max_idle_conns_per_host;
   $("#c-max-host").value = value.performance.max_conns_per_host;
   $("#c-idle-timeout").value = value.performance.idle_conn_timeout_seconds;
@@ -212,7 +214,11 @@ $("#config-form").addEventListener("submit", async (event) => {
       proxyfile: $("#c-proxyfile").value,
       prefer: $("#c-prefer").value,
       upstream: { zen: $("#c-up-zen").value, go: $("#c-up-go").value },
-      retry: { max_attempts: number("#c-attempts"), timeout_seconds: number("#c-timeout") },
+      retry: {
+        max_attempts: number("#c-attempts"),
+        anonymous_max_attempts: number("#c-anonymous-attempts"),
+        timeout_seconds: number("#c-timeout"),
+      },
       models: {
         refresh_seconds: number("#c-refresh"),
         protocols: JSON.parse($("#c-protocols").value || "{}"),
@@ -223,6 +229,7 @@ $("#config-form").addEventListener("submit", async (event) => {
         effort_by_model: JSON.parse($("#c-reasoning-by-model").value || "{}"),
       },
       performance: {
+        disable_proxy_keep_alives: $("#c-disable-proxy-keep-alives").checked,
         max_idle_conns: number("#c-idle"),
         max_idle_conns_per_host: number("#c-idle-host"),
         max_conns_per_host: number("#c-max-host"),

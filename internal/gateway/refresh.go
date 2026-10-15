@@ -24,6 +24,11 @@ func (g *Gateway) syncProxyResult(ctx context.Context, proxy *proxyTransport, st
 	if proxy == nil {
 		return false
 	}
+	if g.anonymous != nil && g.anonymous.rotating && proxy.freshConnections {
+		// An exit failure does not establish that a rotating gateway is down.
+		// Keep the entry eligible so another connection can select another exit.
+		return false
+	}
 	if isProxyFailure(err) {
 		g.rebindFailedProxy(proxy)
 		g.verifyProxyAfterError(ctx, proxy, status)

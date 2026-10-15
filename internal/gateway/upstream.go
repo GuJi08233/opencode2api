@@ -255,15 +255,18 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 	return nil, effectiveRoute, attempts, lastErr
 }
 
-// doAnonymousUpstream tries every currently available proxy at most once. Any
-// failure, including an HTTP error response, advances to the next proxy. Only a
-// successful response ends the anonymous phase; exhausting the proxy cursor
-// returns control to the preferred authenticated tiers.
+// doAnonymousUpstream visits fixed exits once, or revisits rotating gateways
+// within the configured anonymous attempt budget. A rotating gateway's transient
+// failure gets a fresh connection; invalid requests are not replayed. Exhausting
+// the budget returns control to the preferred authenticated tiers.
 func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
 	cursor := g.anonymous.CursorFor(ids.Session)
 	limit := g.anonymous.Len()
+	if g.cfg.Retry.AnonymousMaxAttempts > 0 {
+		limit = g.cfg.Retry.AnonymousMaxAttempts
+	}
 	attempts := 0
 	body := bodies[config.TierZen]
 	if len(body) == 0 {
@@ -320,6 +323,9 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.proxy, resp, err, duration)
 		if err == nil && resp.StatusCode/100 == 2 {
 			g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+			return resp, nil, attempts
+		}
+		if g.anonymous.rotating && isNonRetryableClientResponse(resp, err) {
 			return resp, nil, attempts
 		}
 		lastResponse = resp
