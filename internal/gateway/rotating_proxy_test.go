@@ -144,7 +144,12 @@ func TestProxyConnectionReuse(t *testing.T) {
 			t.Cleanup(transport.CloseIdleConnections)
 			roots := x509.NewCertPool()
 			roots.AddCert(upstream.Certificate())
-			transport.TLSClientConfig = &tls.Config{RootCAs: roots}
+			// Preserve the cloned transport's ALPN configuration, as production
+			// does. Replacing it would hide inherited HTTP/2 negotiation bugs.
+			if transport.TLSClientConfig == nil {
+				transport.TLSClientConfig = &tls.Config{}
+			}
+			transport.TLSClientConfig.RootCAs = roots
 			for range 2 {
 				resp, err := client.Get(upstream.URL)
 				if err != nil {

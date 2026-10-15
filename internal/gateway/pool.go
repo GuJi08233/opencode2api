@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -226,6 +227,12 @@ func newTransportPool(proxies []string, cfg config.PerformanceConfig, responseHe
 			transport.ForceAttemptHTTP2 = false
 			transport.Protocols = new(http.Protocols)
 			transport.Protocols.SetHTTP1(true)
+			// Clone may inherit the default transport's already-initialized h2
+			// ALPN list. Protocols alone does not remove that TLS advertisement.
+			if transport.TLSClientConfig == nil {
+				transport.TLSClientConfig = &tls.Config{}
+			}
+			transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
 			proxy.freshConnections = true
 		}
 		proxy.healthy.Store(true)
