@@ -1,6 +1,6 @@
 # opencode2api
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | [简体中文](README.zh-CN.md) | [Tiếng Việt](README.vi.md)
 
 This fork of [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api) adds fresh connections and anonymous retries for rotating proxy gateways. GitHub Actions publishes this fork's images to `ghcr.io/guji08233/opencode2api`.
 
@@ -120,9 +120,9 @@ Merge these options into your existing configuration, using your proxy credentia
 
 `disable_proxy_keep_alives: true` opens a fresh connection for each proxied request and retry, disabling HTTP/2 multiplexing on those connections. Direct connections retain pooling. A fresh connection gives the proxy a chance to select another exit; exit rotation and session stickiness remain the proxy's responsibility.
 
-A positive `anonymous_max_attempts` bounds total anonymous attempts, including the first, and allows reconnecting to the same rotating proxy gateway. Transport errors, 401/403, 429, and 5xx can be retried; other 4xx responses end the anonymous phase. An individual exit failure does not cool down or mark the whole rotating entry unhealthy. All attempts share the request timeout. This mode requires `disable_proxy_keep_alives`.
+A positive `anonymous_max_attempts` bounds total anonymous HTTP attempts, including the first request and any fallback from legacy `/zen/v1` to `/inference`, and allows reconnecting to the same rotating proxy gateway. Transport errors, 401/403, 429, and 5xx can be retried; other 4xx responses end the anonymous phase, except legacy 404/405 responses can fall back to `/inference` within the same budget. An individual exit failure does not cool down or mark the whole rotating entry unhealthy. All attempts share the request timeout. This mode requires `disable_proxy_keep_alives`.
 
-Defaults of `false` and `0` preserve upstream pooling and anonymous cooldowns. Direct exits are still tried at most once. Both options are available in the WebUI configuration center and support hot reload. Streams already delivered downstream are never replayed.
+Defaults of `false` and `0` preserve upstream pooling and anonymous cooldowns for static proxies. Direct exits are still visited at most once, with legacy and fallback lanes available during that visit. Both options are available in the WebUI configuration center and support hot reload. Streams already delivered downstream are never replayed. The upstream's per-entry `#pool` / `pool+` markers are also supported; see [Rotating proxy pools](#rotating-proxy-pools).
 
 ## API usage
 
@@ -231,11 +231,11 @@ Eligibility is a routing decision; the upstream can still reject or rate-limit t
 
 The routing sequence is:
 
-1. For an eligible model, try each available anonymous proxy once by default. Rotating gateway mode uses the `retry.anonymous_max_attempts` budget described above.
+1. For an eligible model, visit each available anonymous static proxy once by default, preferring legacy `/zen/v1` before falling back to `/inference`. Rotating gateway mode uses the `retry.anonymous_max_attempts` budget described above; `#pool` entries can also cycle using the upstream defaults below.
 2. Try authenticated tiers in `prefer` order, using only tiers with a configured key and a route for that model.
 3. Apply `retry.max_attempts` separately to each authenticated tier.
 
-Anonymous attempts are not cut short by `retry.max_attempts`, but all attempts share the request timeout. Network errors, authentication failures, rate limits, and server errors can rotate keys. Other 4xx responses end the current tier; another available tier may still be tried.
+Static anonymous proxy visits are not cut short by `retry.max_attempts`. With `#pool` entries and no explicit anonymous budget, the visit limit is the larger of the proxy count and `retry.max_attempts`; each visit may try both anonymous lanes. A positive `retry.anonymous_max_attempts` instead caps actual anonymous HTTP requests. All attempts share the request timeout. Network errors, authentication failures, rate limits, and server errors can rotate keys. Other 4xx responses end the current tier; another available tier may still be tried.
 
 Requests are encoded for each tier's own protocol. With `performance.first_event_timeout_seconds` enabled, a successful SSE response is held until the first complete data event. A timeout or disconnect before that event uses the existing key/proxy retry budget; comments do not satisfy the timeout. Once released downstream, the stream is never replayed. The default is `0` (disabled); try `15` seconds for upstreams that accept requests but send no events. This bounds the first event, not the first text token, and does not apply to System One. Rotation aliases use their separate `rotation.first_output_seconds` timeout. A recognized stale Responses reasoning reference can trigger one repair pass; selected-key diagnostics never use that replay.
 
@@ -336,12 +336,35 @@ direct
 
 Comment markers are `#`, `;`, and `//` at the start of a line or after whitespace.
 
+#### Rotating proxy pools
+
+Suffix an entry with `#pool` (or prefix it with `pool+`) to declare that the endpoint is a rotating proxy pool such as [Resin](https://github.com/Resinat/Resin), where every new TCP connection exits from a different IP:
+
+```text
+http://127.0.0.1:7890#pool
+socks5://127.0.0.1:1080#pool
+pool+http://127.0.0.1:7891
+```
+
+A pool entry is handled differently from a static proxy:
+
+| Behavior                  | Static proxy                                                        | `#pool` entry                                                                |
+| ------------------------- | ------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| Connection reuse          | Keep-alive plus HTTP/2 multiplexing (`performance.*` pool settings) | A fresh TCP + CONNECT tunnel per request (`DisableKeepAlives`, no HTTP/2)    |
+| Failure cooldown          | 15s–120s exponential backoff, inflated by `Retry-After`             | None: the next request simply draws a new exit IP                             |
+| Health eviction           | Marked unhealthy, keys rebound, rechecked every 15 minutes          | Never evicted; the health check is skipped entirely                           |
+| Anonymous lane retries    | One visit per available proxy; each visit may try both lanes         | Cycle pool entries within the anonymous budget described above               |
+
+Use it when the endpoint behind the URL already performs the rotation and the pool's own exit IPs are individually rate-limited or flaky; the gateway then treats each attempt as a fresh endpoint instead of pinning the conversation to one exit. A single `#pool` entry is enough — you no longer need to list dozens of exits. Static entries keep the pooling behavior described below.
+
+The static-proxy column assumes this fork's global rotating-gateway options are disabled. A `#pool` entry always uses fresh connections, even when `performance.disable_proxy_keep_alives` is `false`.
+
 ### Timeouts and connection pools
 
 | Field                                   | Default | Meaning                                                |
 | --------------------------------------- | ------- | ------------------------------------------------------ |
 | `retry.max_attempts`                    | `3`     | Attempts per authenticated tier, including the first.  |
-| `retry.anonymous_max_attempts`          | `0`     | 0 visits each proxy once; positive values bound rotating-gateway anonymous attempts, including the first, and require fresh proxy connections. |
+| `retry.anonymous_max_attempts`          | `0`     | 0 uses upstream static / `#pool` visit budgets; positive values cap anonymous HTTP attempts across both lanes and require fresh proxy connections. |
 | `retry.timeout_seconds`                 | `300`   | Total inference timeout, including stream consumption. |
 | `performance.disable_proxy_keep_alives` | `false` | Fresh connections for proxy requests, without HTTP/2 multiplexing; direct requests retain pooling. |
 | `performance.attempt_timeout_seconds`   | `0`     | Whole-attempt bound; 0 uses the request timeout.       |
@@ -408,6 +431,17 @@ The server forces `stream: false`. Use `{"mode":"selected","tier":"zen","id":"KE
 
 After execution, the management endpoint returns HTTP 200 with the actual result in `ok`, `http_status`, `request_id`, `route`, and `response`. Selected-key results also include `selected_key` and `key_test`: `usable`, `rejected`, `rate_limited`, `transport_error`, `upstream_error`, `request_error`, or `unavailable`. Invalid management input, authentication, CSRF, and throttling retain their own HTTP error statuses.
 
+### Interface language
+
+The WebUI loads its translations from `webui/js/i18n.js`. It ships with **简体中文** (default), **English**, and **Tiếng Việt**. The original Simplified Chinese copy lives in `index.html` and `webui/js/` and stays the fallback for every string without a translation, so adding a language never rewrites the original.
+
+- The selector sits in the topbar, and on the login card.
+- The choice is stored in `localStorage` under `opencode2api.ui.lang`.
+- Switching re-renders both static text (`data-i18n`, `data-i18n-attr`) and JavaScript-generated text without reloading the page.
+- Dates and times follow the selected locale as well.
+
+To add a language, add one block to `DICTIONARY` in `webui/js/i18n.js`, then register its code in `SUPPORTED`, `LABELS`, and `DATE_LOCALES`.
+
 ### Saving and reloading
 
 The server validates a candidate configuration and builds its replacement gateway before saving and switching. Failed validation or persistence leaves the active gateway in place. Requests already running continue on their original gateway.
@@ -462,10 +496,10 @@ internal/
   protocol/              Request/response conversion and SSE parsing/output
   telemetry/             Request tracking, metrics, logs, and recovery
 webui/
-  embed.go               Embeds the three static assets into the executable
+  embed.go               Embeds the static assets into the executable
   index.html             Page structure
-  app.js                 UI behavior
-  styles.css             UI styles
+  css/                   Design tokens, base styles, components and page layouts
+  js/                    ES modules: shell, i18n, shared helpers and one module per page
 ```
 
 Suggested reading order:
@@ -473,7 +507,7 @@ Suggested reading order:
 1. [Command entry](cmd/opencode2api/main.go) → [runtime management](internal/gateway/runtime.go) → [HTTP handlers](internal/gateway/gateway.go).
 2. [Upstream attempts](internal/gateway/upstream.go) and [model routing](internal/models/catalog.go) explain how a request reaches a provider.
 3. [Request conversion](internal/protocol/request.go), [response conversion](internal/protocol/response.go), and [stream transport](internal/protocol/stream.go) cover protocol behavior.
-4. [Management routes](internal/admin/server.go) and [WebUI logic](webui/app.js) cover configuration and diagnostics.
+4. [Management routes](internal/admin/server.go) and [WebUI logic](webui/js/main.js) cover configuration and diagnostics.
 
 Run Go formatting, analysis, and the command build:
 
@@ -488,10 +522,10 @@ For local development, start the service with `go run ./cmd/opencode2api -config
 Node.js is only needed for the WebUI JavaScript syntax check:
 
 ```bash
-node --check webui/app.js
+for f in webui/js/*.js webui/js/pages/*.js; do node --input-type=module --check < "$f"; done
 ```
 
-`.editorconfig`, `.gitattributes`, and Go formatting standardize the source. CI runs `go vet` and builds with Go 1.24 and stable Go on Linux/Windows, plus Go formatting, WebUI syntax, and entrypoint shell syntax checks. Release archives include both READMEs.
+`.editorconfig`, `.gitattributes`, and Go formatting standardize the source. CI runs `go vet` and builds with Go 1.24 and stable Go on Linux/Windows, plus Go formatting, WebUI syntax, and entrypoint shell syntax checks. Release archives include all three READMEs.
 
 ## Troubleshooting
 

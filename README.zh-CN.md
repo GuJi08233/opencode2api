@@ -1,6 +1,6 @@
 # opencode2api
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | [简体中文](README.zh-CN.md) | [Tiếng Việt](README.vi.md)
 
 这是 [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api) 的 Fork，新增单入口轮换代理池的新连接与匿名重试支持。镜像由本仓库的 GitHub Actions 发布到 `ghcr.io/guji08233/opencode2api`。
 
@@ -120,9 +120,9 @@ docker run -d --name opencode2api \
 
 `disable_proxy_keep_alives: true` 让每次代理请求（包括每次重试）使用新的连接，并关闭这些连接上的 HTTP/2 复用；`direct` 连接仍可复用。它只保证新连接，是否切换出口 IP、是否保持粘性会话由代理池决定。
 
-`anonymous_max_attempts` 大于 0 时限制匿名阶段的总尝试次数，包含首次请求，并允许再次连接同一个代理池入口。网络错误、401/403、429 和 5xx 可以重试；其他 4xx 立即结束匿名阶段。一次出口失败不会将整个轮换入口置于冷却或标记为不可用；所有尝试仍受请求总超时约束。这个模式要求同时开启 `disable_proxy_keep_alives`。
+`anonymous_max_attempts` 大于 0 时限制匿名阶段的 HTTP 请求总次数，包含首次请求以及从旧版 `/zen/v1` 回退到 `/inference` 的请求，并允许再次连接同一个代理池入口。网络错误、401/403、429 和 5xx 可以重试；其他 4xx 立即结束匿名阶段，但旧接口的 404/405 可在同一预算内回退到 `/inference`。一次出口失败不会将整个轮换入口置于冷却或标记为不可用；所有尝试仍受请求总超时约束。这个模式要求同时开启 `disable_proxy_keep_alives`。
 
-默认值为 `false` 和 `0`，保留原项目的连接池与匿名代理冷却行为。直连出口仍最多尝试一次。配置中心也可编辑这两个选项，保存后热重载生效。已交付客户端的流式响应不会被重放。
+默认值为 `false` 和 `0`，保留静态代理的连接池与匿名冷却行为。直连出口仍最多访问一次，该次访问可尝试旧接口及回退接口。配置中心也可编辑这两个选项，保存后热重载生效。已交付客户端的流式响应不会被重放。同时支持上游新增的逐条代理 `#pool` / `pool+` 标记，详见下文的“轮换代理池”。
 
 ## API 调用
 
@@ -231,11 +231,11 @@ System One 将自由文本状态与类型化问题配对，并返回类型化答
 
 路由顺序：
 
-1. 符合条件的模型先尝试匿名通道，默认每个可用代理最多一次；启用上述代理池模式时使用 `retry.anonymous_max_attempts` 预算。
+1. 符合条件的模型先尝试匿名通道，默认每个可用静态代理最多访问一次，优先旧版 `/zen/v1`，失败后回退到 `/inference`。启用上述代理池模式时使用 `retry.anonymous_max_attempts` 预算；`#pool` 条目也可按下述上游默认预算循环访问。
 2. 按 `prefer` 顺序尝试认证通道，仅包含已配置 Key 且可以提供该模型的 Tier。
 3. 每个认证 Tier 分别使用 `retry.max_attempts` 预算。
 
-匿名阶段不受 `retry.max_attempts` 截断，但所有阶段共享请求总超时。网络错误、认证失败、限流和服务端错误可以触发 Key 轮换；其他 4xx 会结束当前 Tier，仍可继续尝试另一个可用 Tier。
+静态匿名代理的访问次数不受 `retry.max_attempts` 截断。包含 `#pool` 且未显式指定匿名预算时，代理访问上限取代理数量与 `retry.max_attempts` 的较大值，每次访问可尝试两个匿名接口；`retry.anonymous_max_attempts` 大于 0 时则限制实际匿名 HTTP 请求总数。所有阶段共享请求总超时。网络错误、认证失败、限流和服务端错误可以触发 Key 轮换；其他 4xx 会结束当前 Tier，仍可继续尝试另一个可用 Tier。
 
 每个 Tier 使用自己的原生协议编码请求。启用 `performance.first_event_timeout_seconds` 后，会先等待完整的 SSE data 事件再向客户端交付响应；注释心跳不算首事件。首事件前超时或断开会沿用现有 Key / 代理重试预算，交付后不再重放。默认 `0` 关闭，可对接受请求后无事件的上游尝试设置为 `15` 秒。它限制首事件而非首个文本 token，不适用于 System One；轮转别名使用独立的 `rotation.first_output_seconds`。识别到过期的 Responses reasoning 引用时，可执行一次修复重试；指定 Key 的诊断不会执行该重试。
 
@@ -331,12 +331,35 @@ direct
 
 支持 `#`、`;`、`//` 注释标记，标记需要位于行首或空白字符之后。
 
+#### 轮换代理池
+
+在条目末尾追加 `#pool`（或在开头加 `pool+`）即可声明该地址是轮换代理池（例如 [Resin](https://github.com/Resinat/Resin)），每次新建 TCP 连接都会从不同出口 IP 发出：
+
+```text
+http://127.0.0.1:7890#pool
+socks5://127.0.0.1:1080#pool
+pool+http://127.0.0.1:7891
+```
+
+代理池条目的处理方式与静态代理完全不同：
+
+| 行为         | 静态代理                                    | `#pool` 条目                                              |
+| ------------ | ------------------------------------------- | --------------------------------------------------------- |
+| 连接复用     | Keep-alive + HTTP/2 多路复用（`performance.*` 连接池参数） | 每次请求新建 TCP + CONNECT 隧道（`DisableKeepAlives`，禁用 HTTP/2） |
+| 失败冷却     | 15s–120s 指数退避，并受 `Retry-After` 影响  | 无冷却：下一次请求直接换一个新出口 IP                     |
+| 可用性剔除   | 标记不可用、迁移 Key、每 15 分钟复检        | 永不剔除，完全跳过健康检查                                |
+| 匿名通道重试 | 每个可用代理访问一次，该次可尝试两个接口    | 按上述匿名预算循环访问代理池条目                         |
+
+当 URL 背后的服务本身就在做轮换、而池内出口 IP 会被单独限流或不稳定时使用它：网关会把每次尝试都当作新出口，而不是把整个会话固定在某个出口上。只要一条 `#pool` 条目即可，无需再罗列几十个出口。静态条目仍然保留下文的连接池行为。
+
+表中的静态代理行为以未启用本 Fork 的全局轮换代理选项为前提。即使 `performance.disable_proxy_keep_alives` 为 `false`，`#pool` 条目也始终使用新连接。
+
 ### 超时与连接池
 
 | 字段                                    | 默认值 | 含义                                             |
 | --------------------------------------- | ------ | ------------------------------------------------ |
 | `retry.max_attempts`                    | `3`    | 每个认证 Tier 的尝试次数，包含首次请求。         |
-| `retry.anonymous_max_attempts`          | `0`    | 0 保留每个代理一次；大于 0 为轮换代理池匿名尝试总数，包含首次，需开启代理新连接。 |
+| `retry.anonymous_max_attempts`          | `0`    | 0 使用上游静态 / `#pool` 访问预算；大于 0 限制两个接口合计的匿名 HTTP 请求总数，需开启代理新连接。 |
 | `retry.timeout_seconds`                 | `300`  | 推理请求总超时，包含流式响应读取。               |
 | `performance.disable_proxy_keep_alives` | `false` | 每次代理请求使用新连接并禁用 HTTP/2 复用，直连不受影响。 |
 | `performance.attempt_timeout_seconds`   | `0`    | 单次尝试的总超时；0 表示使用请求总超时。         |
@@ -403,6 +426,17 @@ Playground 需要已登录的 Session 和 `X-CSRF-Token`，每个客户端 IP �
 
 执行后，管理接口返回 HTTP 200，实际结果位于 `ok`、`http_status`、`request_id`、`route` 和 `response`。指定 Key 时还返回 `selected_key` 与 `key_test`，其值包括 `usable`、`rejected`、`rate_limited`、`transport_error`、`upstream_error`、`request_error`、`unavailable`。管理请求格式、认证、CSRF 和限速错误仍返回各自对应的 HTTP 状态。
 
+### 界面语言
+
+WebUI 从 `webui/js/i18n.js` 加载翻译，内置 **简体中文**（默认）、**English** 和 **Tiếng Việt**。原始简体中文文案保留在 `index.html` 和 `webui/js/` 中，并始终作为缺少翻译时的回退，因此新增语言不会覆盖原文。
+
+- 语言选择器位于顶部工具栏右侧，登录卡片上也有一个。
+- 选择结果保存在 `localStorage`，键名为 `opencode2api.ui.lang`。
+- 切换语言会同时重绘静态文案（`data-i18n`、`data-i18n-attr`）和 JavaScript 生成的文案，无需刷新页面。
+- 日期时间格式跟随所选语言。
+
+新增语言时，在 `webui/js/i18n.js` 的 `DICTIONARY` 中增加一个语言块，并在 `SUPPORTED`、`LABELS` 和 `DATE_LOCALES` 中登记其代码。
+
 ### 保存与重载
 
 服务先验证候选配置并创建新的 Gateway，然后保存配置并切换实例。验证或保存失败时，当前 Gateway 继续处理请求；已经开始的请求继续使用原有实例。
@@ -457,10 +491,10 @@ internal/
   protocol/              请求和响应转换、SSE 解析与输出
   telemetry/             请求跟踪、指标、日志与异常恢复
 webui/
-  embed.go               将三个静态资源内嵌到可执行文件
+  embed.go               将静态资源内嵌到可执行文件
   index.html             页面结构
-  app.js                 界面交互
-  styles.css             界面样式
+  css/                   设计 token、基础样式、组件与页面布局
+  js/                    ES 模块：外壳、i18n、共享辅助与每页一个模块
 ```
 
 建议阅读顺序：
@@ -468,7 +502,7 @@ webui/
 1. [程序入口](cmd/opencode2api/main.go) → [运行时管理](internal/gateway/runtime.go) → [HTTP 处理](internal/gateway/gateway.go)。
 2. [上游请求](internal/gateway/upstream.go)和[模型路由](internal/models/catalog.go)说明请求如何选择并到达上游。
 3. [请求转换](internal/protocol/request.go)、[响应转换](internal/protocol/response.go)和[流式传输](internal/protocol/stream.go)说明协议处理过程。
-4. [管理路由](internal/admin/server.go)和 [WebUI 交互](webui/app.js)说明配置编辑与诊断功能。
+4. [管理路由](internal/admin/server.go)和 [WebUI 交互](webui/js/main.js)说明配置编辑与诊断功能。
 
 执行 Go 格式化、静态分析和程序构建：
 
@@ -483,10 +517,10 @@ go build -o opencode2api ./cmd/opencode2api
 Node.js 仅用于 WebUI 的 JavaScript 语法检查：
 
 ```bash
-node --check webui/app.js
+for f in webui/js/*.js webui/js/pages/*.js; do node --input-type=module --check < "$f"; done
 ```
 
-项目通过 `.editorconfig`、`.gitattributes` 和 Go 格式化统一格式。CI 覆盖 Linux / Windows 上的 Go 1.24 与稳定版 Go 的 `go vet` 和构建，以及 Go 格式、WebUI 语法和容器入口脚本语法检查。发布压缩包包含中英文两份 README。
+项目通过 `.editorconfig`、`.gitattributes` 和 Go 格式化统一格式。CI 覆盖 Linux / Windows 上的 Go 1.24 与稳定版 Go 的 `go vet` 和构建，以及 Go 格式、WebUI 语法和容器入口脚本语法检查。发布压缩包包含中英越三份 README。
 
 ## 常见问题
 

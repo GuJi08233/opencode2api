@@ -18,15 +18,12 @@ const (
 )
 
 // syncProxyResult updates proxy health from real traffic. Only timeouts and
-// connection refusals mark a proxy unavailable. Other errors and 4xx/5xx
-// responses trigger a neutral URL check without being treated as proxy failure.
+// connection refusals mark a proxy unavailable. Any HTTP response — including
+// 4xx/5xx — proves the route is reachable and restores a proxy evicted by an
+// earlier transient failure, so a rate-limited exit is never blamed on the
+// proxy route itself.
 func (g *Gateway) syncProxyResult(ctx context.Context, proxy *proxyTransport, status int, err error) bool {
-	if proxy == nil {
-		return false
-	}
-	if g.anonymous != nil && g.anonymous.rotating && proxy.freshConnections {
-		// An exit failure does not establish that a rotating gateway is down.
-		// Keep the entry eligible so another connection can select another exit.
+	if proxy == nil || g.anonymous.isRotating(proxy) {
 		return false
 	}
 	if isProxyFailure(err) {
@@ -41,12 +38,19 @@ func (g *Gateway) syncProxyResult(ctx context.Context, proxy *proxyTransport, st
 		}
 		return false
 	}
+	if err == nil && status >= 400 && status < 600 {
+		// Receiving an HTTP status from the upstream proves the proxy route
+		// itself is reachable; restore an unhealthy flag left by an earlier
+		// transient timeout instead of keeping the route evicted.
+		wasHealthy := proxy.healthy.Swap(true)
+		if !wasHealthy {
+			g.restoreProxy(proxy)
+		}
+		return false
+	}
 	if err != nil {
 		g.verifyProxyAfterError(ctx, proxy, status)
 		return false
-	}
-	if status >= 400 && status < 600 {
-		g.verifyProxyAfterError(ctx, proxy, status)
 	}
 	return false
 }
@@ -221,17 +225,33 @@ func (g *Gateway) refreshZen(ctx context.Context) []string {
 func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []string {
 	cursor := g.anonymous.CursorFor("")
 	limit := g.anonymous.Len()
-	for attempt := 1; attempt <= limit; attempt++ {
+	attemptLimit := g.cfg.Retry.AnonymousMaxAttempts
+	if attemptLimit > 0 {
+		limit = attemptLimit
+	} else if g.anonymous.HasPool() && g.cfg.Retry.MaxAttempts > limit {
+		limit = g.cfg.Retry.MaxAttempts
+	}
+	requests := 0
+	for attempt := 1; attempt <= limit && (attemptLimit == 0 || requests < attemptLimit); attempt++ {
 		node := cursor.Next()
 		if node == nil {
 			break
 		}
 		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		models, status, err := modelcatalog.FetchModels(refreshCtx, node.proxy.client, base, anonymousZenKey)
-		if err != nil && status == 404 {
-			// The new inference backend does not expose a models listing;
-			// probe the legacy Zen console origin once before giving up.
-			models, status, err = modelcatalog.FetchModels(refreshCtx, node.proxy.client, modelcatalog.LegacyZenBase, anonymousZenKey)
+		var models []string
+		var status int
+		var err error
+		// Prefer the legacy /zen/v1 models listing before falling back to the
+		// configured anonymous upstream.
+		for _, upstream := range g.anonymousUpstreams() {
+			if attemptLimit > 0 && requests >= attemptLimit {
+				break
+			}
+			requests++
+			models, status, err = modelcatalog.FetchModels(refreshCtx, node.proxy.client, upstream, anonymousZenKey)
+			if err == nil {
+				break
+			}
 		}
 		g.syncProxyResult(refreshCtx, node.proxy, status, err)
 		cancel()

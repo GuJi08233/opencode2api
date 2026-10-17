@@ -5,12 +5,15 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -111,10 +114,12 @@ func TestProxyConnectionReuse(t *testing.T) {
 	for _, tc := range []struct {
 		name, protocol string
 		fresh, direct  bool
+		pool           bool
 		connections    int32
 	}{
 		{name: "default SOCKS tunnel reused", protocol: "HTTP/2.0", connections: 1},
 		{name: "fresh SOCKS tunnel per request", protocol: "HTTP/1.1", fresh: true, connections: 2},
+		{name: "marked pool overrides reusable proxy setting", protocol: "HTTP/1.1", pool: true, connections: 2},
 		{name: "direct HTTP2 remains reusable", protocol: "HTTP/2.0", fresh: true, direct: true, connections: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -131,9 +136,34 @@ func TestProxyConnectionReuse(t *testing.T) {
 			}
 			upstream.StartTLS()
 			t.Cleanup(upstream.Close)
+			roots := x509.NewCertPool()
+			roots.AddCert(upstream.Certificate())
+			// An already-used default transport carries HTTP/2 ALPN state into
+			// Clone. Exercise that production case before testing fresh tunnels.
+			originalDefault := http.DefaultTransport
+			initializedDefault := originalDefault.(*http.Transport).Clone()
+			initializedDefault.TLSClientConfig = &tls.Config{RootCAs: roots}
+			warmup, err := (&http.Client{Transport: initializedDefault}).Get(upstream.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			io.Copy(io.Discard, warmup.Body)
+			warmup.Body.Close()
+			if warmup.ProtoMajor != 2 {
+				t.Fatalf("warmup protocol = %s, want HTTP/2.0", warmup.Proto)
+			}
+			initializedDefault.CloseIdleConnections()
+			connections.Store(0)
+			http.DefaultTransport = initializedDefault
+			t.Cleanup(func() {
+				http.DefaultTransport = originalDefault
+				initializedDefault.CloseIdleConnections()
+			})
 			proxyURL, tunnels := newSOCKSProxy(t)
 			if tc.direct {
 				proxyURL = "direct"
+			} else if tc.pool {
+				proxyURL += "#pool"
 			}
 			pool, err := newTransportPool([]string{proxyURL}, testPerformance(tc.fresh), 2*time.Second)
 			if err != nil {
@@ -142,8 +172,6 @@ func TestProxyConnectionReuse(t *testing.T) {
 			client := pool.items[0].client
 			transport := client.Transport.(*http.Transport)
 			t.Cleanup(transport.CloseIdleConnections)
-			roots := x509.NewCertPool()
-			roots.AddCert(upstream.Certificate())
 			// Preserve the cloned transport's ALPN configuration, as production
 			// does. Replacing it would hide inherited HTTP/2 negotiation bugs.
 			if transport.TLSClientConfig == nil {
@@ -171,6 +199,26 @@ func TestProxyConnectionReuse(t *testing.T) {
 	}
 }
 
+// anonymousMockTransport keeps both anonymous lanes inside the local proxy
+// fixture. In production the legacy lane uses HTTPS; downgrading only this
+// test request avoids a CONNECT handshake while retaining real proxy TCP
+// connection accounting. Reject every other destination before any dial.
+type anonymousMockTransport struct {
+	base *http.Transport
+}
+
+func (transport anonymousMockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.HasPrefix(req.URL.String(), models.LegacyZenBase+"/") {
+		req = req.Clone(req.Context())
+		req.URL.Scheme = "http"
+		req.URL.Host = "upstream.invalid"
+		req.Host = req.URL.Host
+	} else if req.URL.Scheme != "http" || req.URL.Host != "upstream.invalid" {
+		return nil, fmt.Errorf("unexpected mock upstream: %s", req.URL)
+	}
+	return transport.base.RoundTrip(req)
+}
+
 func TestAnonymousRotatingProxyRetries(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -178,16 +226,31 @@ func TestAnonymousRotatingProxyRetries(t *testing.T) {
 		budget     int
 		attempts   int
 		wantStatus int
+		pool       bool
+		wantLanes  []string
 	}{
-		{name: "quota then server failure then success", statuses: []int{429, 503, 200}, budget: 3, attempts: 3, wantStatus: 200},
-		{name: "dropped tunnel then success", statuses: []int{0, 200}, budget: 3, attempts: 2, wantStatus: 200},
-		{name: "finite retry budget", statuses: []int{429}, budget: 3, attempts: 3, wantStatus: 429},
-		{name: "invalid request not replayed", statuses: []int{400, 200}, budget: 3, attempts: 1, wantStatus: 400},
-		{name: "legacy single proxy attempted once", statuses: []int{429, 200}, budget: 0, attempts: 1, wantStatus: 429},
+		{name: "legacy lane succeeds first", statuses: []int{200}, budget: 3, attempts: 1, wantStatus: 200, wantLanes: []string{"legacy"}},
+		{name: "quota then server failure then success", statuses: []int{429, 503, 200}, budget: 3, attempts: 3, wantStatus: 200, wantLanes: []string{"legacy", "inference", "legacy"}},
+		{name: "dropped tunnel then success", statuses: []int{0, 200}, budget: 3, attempts: 2, wantStatus: 200, wantLanes: []string{"legacy", "inference"}},
+		{name: "finite retry budget", statuses: []int{429}, budget: 3, attempts: 3, wantStatus: 429, wantLanes: []string{"legacy", "inference", "legacy"}},
+		{name: "one attempt cannot enter fallback lane", statuses: []int{429, 200}, budget: 1, attempts: 1, wantStatus: 429, wantLanes: []string{"legacy"}},
+		{name: "two attempts cover both lanes once", statuses: []int{429, 503, 200}, budget: 2, attempts: 2, wantStatus: 503, wantLanes: []string{"legacy", "inference"}},
+		{name: "marked pool rotates without global fresh setting", statuses: []int{429, 503, 200}, attempts: 3, wantStatus: 200, pool: true, wantLanes: []string{"legacy", "inference", "legacy"}},
+		{name: "marked pool default budget counts proxy visits", statuses: []int{429}, attempts: 6, wantStatus: 429, pool: true, wantLanes: []string{"legacy", "inference", "legacy", "inference", "legacy", "inference"}},
+		{name: "marked pool respects explicit HTTP budget", statuses: []int{429}, budget: 3, attempts: 3, wantStatus: 429, pool: true, wantLanes: []string{"legacy", "inference", "legacy"}},
+		{name: "invalid request not replayed", statuses: []int{400, 200}, budget: 3, attempts: 1, wantStatus: 400, wantLanes: []string{"legacy"}},
+		{name: "missing legacy lane falls back", statuses: []int{404, 200}, budget: 3, attempts: 2, wantStatus: 200, wantLanes: []string{"legacy", "inference"}},
+		{name: "fallback invalid request not replayed", statuses: []int{404, 400, 200}, budget: 3, attempts: 2, wantStatus: 400, wantLanes: []string{"legacy", "inference"}},
+		{name: "single fixed proxy keeps lane fallback", statuses: []int{429, 200}, attempts: 2, wantStatus: 200, wantLanes: []string{"legacy", "inference"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls, connections := new(atomic.Int32), new(atomic.Int32)
+			var pathsMu sync.Mutex
+			var paths []string
 			proxy := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				pathsMu.Lock()
+				paths = append(paths, r.URL.Path)
+				pathsMu.Unlock()
 				i := int(calls.Add(1)) - 1
 				status := tc.statuses[min(i, len(tc.statuses)-1)]
 				if status == 0 {
@@ -210,20 +273,28 @@ func TestAnonymousRotatingProxyRetries(t *testing.T) {
 			proxy.Start()
 			t.Cleanup(proxy.Close)
 			fresh := tc.budget > 0
-			pool, err := newTransportPool([]string{proxy.URL}, testPerformance(fresh), time.Second)
+			proxyURL := proxy.URL
+			if tc.pool {
+				proxyURL += "#pool"
+			}
+			pool, err := newTransportPool([]string{proxyURL}, testPerformance(fresh), time.Second)
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(pool.items[0].client.CloseIdleConnections)
+			transport := pool.items[0].client.Transport.(*http.Transport)
+			t.Cleanup(transport.CloseIdleConnections)
+			pool.items[0].client.Transport = anonymousMockTransport{base: transport}
 			g := &Gateway{
-				cfg:    config.Config{Retry: config.RetryConfig{AnonymousMaxAttempts: tc.budget}, Upstream: config.UpstreamConfig{Anonymous: "http://upstream.invalid"}},
+				cfg:    config.Config{Retry: config.RetryConfig{MaxAttempts: 3, AnonymousMaxAttempts: tc.budget}, Upstream: config.UpstreamConfig{Anonymous: "http://upstream.invalid/inference"}},
 				logger: slog.New(slog.NewTextHandler(io.Discard, nil)), transports: pool,
 				anonymous: newAnonymousPool(true, pool, 15*time.Second, fresh),
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			if !fresh {
-				// Avoid real connectivity probes while checking the legacy budget.
+			if !fresh && !tc.pool {
+				// Static legacy behavior needs no background connectivity probe.
+				// Rotating cases use normal failure handling to verify that the
+				// gateway stays healthy and its anonymous node never cools down.
 				ctx = WithDiagnosticRequest(ctx)
 			}
 			route := models.Route{ID: "test-free", Tier: config.TierZen, Protocol: wire.Chat, Anonymous: true}
@@ -237,10 +308,21 @@ func TestAnonymousRotatingProxyRetries(t *testing.T) {
 			if attempts != tc.attempts || int(calls.Load()) != tc.attempts || resp.StatusCode != tc.wantStatus {
 				t.Fatalf("attempts=%d calls=%d status=%d; want %d attempts, status %d", attempts, calls.Load(), resp.StatusCode, tc.attempts, tc.wantStatus)
 			}
-			if fresh && int(connections.Load()) != tc.attempts {
+			pathsMu.Lock()
+			defer pathsMu.Unlock()
+			for i, lane := range tc.wantLanes {
+				prefix := "/zen"
+				if lane == "inference" {
+					prefix = "/inference"
+				}
+				if want := prefix + wire.Path(wire.Chat); paths[i] != want {
+					t.Fatalf("attempt %d path = %q, want %q (%s lane)", i+1, paths[i], want, lane)
+				}
+			}
+			if (fresh || tc.pool) && int(connections.Load()) != tc.attempts {
 				t.Fatalf("connections=%d, want one per attempt (%d)", connections.Load(), tc.attempts)
 			}
-			if fresh && (!pool.items[0].healthy.Load() || g.anonymous.nodes[0].cooldownUntil.Load() != 0) {
+			if (fresh || tc.pool) && (!pool.items[0].healthy.Load() || g.anonymous.nodes[0].cooldownUntil.Load() != 0) {
 				t.Fatal("one exit failure cooled down the entire rotating gateway")
 			}
 		})
@@ -256,5 +338,27 @@ func TestAnonymousFixedExitStillCoolsDown(t *testing.T) {
 	cursor := pool.CursorFor("")
 	if cursor.Next() != nil {
 		t.Fatal("fixed exit in cooldown was selected")
+	}
+}
+
+func TestAnonymousCursorSkipsCoolingFixedExitBesidePool(t *testing.T) {
+	fixed, rotating := &proxyTransport{}, &proxyTransport{pool: true}
+	fixed.healthy.Store(true)
+	rotating.healthy.Store(true)
+	pool := newAnonymousPool(true, &transportPool{items: []*proxyTransport{fixed, rotating}}, time.Second, false)
+	quota := &http.Response{StatusCode: http.StatusTooManyRequests, Header: make(http.Header)}
+	pool.MarkFailure(pool.nodes[0], quota, nil)
+	pool.MarkFailure(pool.nodes[1], quota, nil)
+	if pool.nodes[0].cooldownUntil.Load() == 0 {
+		t.Fatal("fixed exit did not enter cooldown")
+	}
+	if pool.nodes[1].cooldownUntil.Load() != 0 {
+		t.Fatal("one pool exit failure cooled down the rotating gateway")
+	}
+	cursor := pool.CursorFor("")
+	for attempt := range 4 {
+		if node := cursor.Next(); node != pool.nodes[1] {
+			t.Fatalf("attempt %d selected %p, want rotating node %p", attempt+1, node, pool.nodes[1])
+		}
 	}
 }

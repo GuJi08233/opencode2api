@@ -25,6 +25,7 @@ import (
 type proxyTransport struct {
 	index  int
 	name   string
+	pool   bool
 	client *http.Client
 	// A fresh proxy connection lets a rotating gateway select a new exit.
 	freshConnections bool
@@ -43,6 +44,7 @@ type anonymousPool struct {
 	nodes    []*anonymousNode
 	next     atomic.Uint64
 	cooldown time.Duration
+	hasPool  bool
 	rotating bool
 }
 
@@ -65,6 +67,9 @@ func newAnonymousPool(enabled bool, transports *transportPool, cooldown time.Dur
 	}
 	pool.nodes = make([]*anonymousNode, 0, len(transports.items))
 	for _, proxy := range transports.items {
+		if pool.isRotating(proxy) {
+			pool.hasPool = true
+		}
 		pool.nodes = append(pool.nodes, &anonymousNode{proxy: proxy})
 	}
 	return pool
@@ -75,6 +80,16 @@ func (p *anonymousPool) Len() int {
 		return 0
 	}
 	return len(p.nodes)
+}
+
+func (p *anonymousPool) HasPool() bool {
+	return p != nil && p.hasPool
+}
+
+// isRotating recognizes both explicit #pool entries and the original global
+// fresh-connection mode when its anonymous retry budget is enabled.
+func (p *anonymousPool) isRotating(proxy *proxyTransport) bool {
+	return proxy != nil && (proxy.pool || (p != nil && p.rotating && proxy.freshConnections))
 }
 
 func (p *anonymousPool) CursorFor(affinity string) anonymousCursor {
@@ -92,21 +107,23 @@ func (p *anonymousPool) CursorFor(affinity string) anonymousCursor {
 	return anonymousCursor{pool: p, start: start}
 }
 
-// Fixed exits are visited at most once. Rotating gateways may be revisited
-// within the caller's attempt budget; each visit creates a fresh connection.
+// Next visits healthy, non-cooling fixed exits at most once. Rotating
+// gateways may be revisited within the caller's finite attempt budget; each
+// visit creates a fresh connection instead of reusing a failed exit.
 func (c *anonymousCursor) Next() *anonymousNode {
 	if c.pool == nil || len(c.pool.nodes) == 0 {
 		return nil
 	}
+	n := len(c.pool.nodes)
 	now := time.Now().UnixNano()
-	for scanned := 0; scanned < len(c.pool.nodes); scanned++ {
-		node := c.pool.nodes[(c.start+c.offset)%len(c.pool.nodes)]
-		revisited := c.offset >= len(c.pool.nodes)
+	for range n {
+		node := c.pool.nodes[(c.start+c.offset)%n]
+		revisited := c.offset >= n
 		c.offset++
-		if revisited && (!c.pool.rotating || !node.proxy.freshConnections) {
-			continue
+		if c.pool.isRotating(node.proxy) {
+			return node
 		}
-		if node.proxy.healthy.Load() && node.cooldownUntil.Load() <= now {
+		if !revisited && node.proxy.healthy.Load() && node.cooldownUntil.Load() <= now {
 			return node
 		}
 	}
@@ -154,12 +171,7 @@ func (p *anonymousPool) RestoreProxy(proxy *proxyTransport) int {
 const maxAnonymousRetryAfterMultiplier = 8
 
 func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, err error) {
-	if node == nil {
-		return
-	}
-	// One exit's quota or network failure must not cool down every exit behind
-	// the same gateway. The request's finite attempt/timeout budget bounds retries.
-	if p.rotating && node.proxy.freshConnections {
+	if node == nil || p.isRotating(node.proxy) {
 		return
 	}
 	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
@@ -199,42 +211,47 @@ func (p *transportPool) healthCounts() (total, healthy int) {
 func newTransportPool(proxies []string, cfg config.PerformanceConfig, responseHeaderTimeout time.Duration) (*transportPool, error) {
 	p := &transportPool{items: make([]*proxyTransport, 0, len(proxies))}
 	for _, raw := range proxies {
+		clean, isPool := config.ParseProxyEntry(raw)
+		fresh := clean != "direct" && (isPool || cfg.DisableProxyKeepAlives)
 		transport := http.DefaultTransport.(*http.Transport).Clone()
 		transport.MaxIdleConns = cfg.MaxIdleConns
 		transport.MaxIdleConnsPerHost = cfg.MaxIdleConnsPerHost
 		transport.MaxConnsPerHost = cfg.MaxConnsPerHost
 		transport.IdleConnTimeout = time.Duration(cfg.IdleConnTimeoutSeconds) * time.Second
 		transport.ResponseHeaderTimeout = responseHeaderTimeout
-		transport.ForceAttemptHTTP2 = true
+		transport.ForceAttemptHTTP2 = !fresh
+		transport.DisableKeepAlives = fresh
+		if fresh {
+			transport.Protocols = new(http.Protocols)
+			transport.Protocols.SetHTTP1(true)
+			// Cloning DefaultTransport after its first dial inherits the
+			// already-configured HTTP/2 ALPN and TLSNextProto map, which ignores
+			// DisableKeepAlives and req.Close and multiplexes every request over
+			// one CONNECT tunnel. An explicit empty TLSNextProto map and HTTP/1.1
+			// ALPN force a brand-new TCP + CONNECT tunnel per attempt.
+			transport.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
+			if transport.TLSClientConfig == nil {
+				transport.TLSClientConfig = &tls.Config{NextProtos: []string{"http/1.1"}}
+			} else {
+				tlsCfg := transport.TLSClientConfig.Clone()
+				tlsCfg.NextProtos = []string{"http/1.1"}
+				transport.TLSClientConfig = tlsCfg
+			}
+		}
 		transport.DialContext = (&net.Dialer{
 			Timeout:   time.Duration(cfg.ConnectTimeoutSeconds) * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext
-		if raw == "direct" {
+		if clean == "direct" {
 			transport.Proxy = nil
 		} else {
-			u, err := url.Parse(raw)
+			u, err := url.Parse(clean)
 			if err != nil {
 				return nil, fmt.Errorf("parse proxy %s: %w", config.RedactURL(raw), err)
 			}
 			transport.Proxy = http.ProxyURL(u)
 		}
-		proxy := &proxyTransport{index: len(p.items), name: raw, client: &http.Client{Transport: transport}}
-		if raw != "direct" && cfg.DisableProxyKeepAlives {
-			transport.DisableKeepAlives = true
-			// HTTP/2 multiplexing would otherwise keep multiple requests on one
-			// proxy tunnel. Restrict this mode to one HTTP/1.1 request per connection.
-			transport.ForceAttemptHTTP2 = false
-			transport.Protocols = new(http.Protocols)
-			transport.Protocols.SetHTTP1(true)
-			// Clone may inherit the default transport's already-initialized h2
-			// ALPN list. Protocols alone does not remove that TLS advertisement.
-			if transport.TLSClientConfig == nil {
-				transport.TLSClientConfig = &tls.Config{}
-			}
-			transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
-			proxy.freshConnections = true
-		}
+		proxy := &proxyTransport{index: len(p.items), name: raw, pool: isPool, freshConnections: fresh, client: &http.Client{Transport: transport}}
 		proxy.healthy.Store(true)
 		p.items = append(p.items, proxy)
 	}
@@ -256,7 +273,7 @@ func (p *transportPool) CheckHealth(ctx context.Context, target string, timeout 
 	results := make(chan proxyHealthResult, len(p.items))
 	checks := 0
 	for _, proxy := range p.items {
-		if proxy.healthy.Load() || !proxy.checking.CompareAndSwap(false, true) {
+		if proxy.pool || proxy.healthy.Load() || !proxy.checking.CompareAndSwap(false, true) {
 			continue
 		}
 		// A real request may have restored the proxy between the first health
