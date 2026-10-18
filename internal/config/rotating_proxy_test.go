@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"encoding/json"
+	"os"
+	"testing"
+)
 
 func TestRotatingProxyConfiguration(t *testing.T) {
 	baseline, err := Load("../../config.example.json")
@@ -20,7 +24,7 @@ func TestRotatingProxyConfiguration(t *testing.T) {
 		{name: "retries require fresh connections", attempts: 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := Clone(baseline)
+			cfg := baseline
 			cfg.Retry.AnonymousMaxAttempts = tc.attempts
 			cfg.Performance.DisableProxyKeepAlives = tc.fresh
 			cfg, err := Normalize("config.json", cfg)
@@ -29,7 +33,11 @@ func TestRotatingProxyConfiguration(t *testing.T) {
 			}
 			if tc.valid {
 				path := t.TempDir() + "/config.json"
-				if err := SaveAtomic(path, cfg); err != nil {
+				data, err := json.Marshal(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, data, 0600); err != nil {
 					t.Fatal(err)
 				}
 				saved, err := Load(path)

@@ -1,4 +1,4 @@
-// Command opencode2api starts the API gateway and its management interface.
+// Command opencode2api starts the anonymous free-tier API gateway.
 package main
 
 import (
@@ -11,7 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	adminui "opencode2api/internal/admin"
 	"opencode2api/internal/buildinfo"
 	"opencode2api/internal/config"
 	"opencode2api/internal/gateway"
@@ -25,7 +24,6 @@ func main() {
 	buildinfo.Version = version
 	configPath := flag.String("config", "config.json", "path to config.json")
 	listen := flag.String("listen", "", "override the configured API listen address")
-	webListen := flag.String("web-listen", "", "override the configured WebUI listen address")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -36,20 +34,16 @@ func main() {
 	if *listen != "" {
 		cfg.Listen = *listen
 	}
-	if *webListen != "" {
-		cfg.WebUI.Listen = *webListen
-	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	level := new(slog.LevelVar)
 	telemetry.SetLogLevel(level, cfg.Logging.Level)
-	hub := telemetry.NewLogHub(cfg.Logging.RingSize)
 	redactor := config.NewSecretRedactor()
 	redactor.Replace(cfg)
-	logger := telemetry.NewStructuredLogger(level, hub, redactor)
+	logger := telemetry.NewStructuredLogger(level, redactor)
 	monitor := telemetry.NewMonitor()
-	manager, err := gateway.NewRuntimeManager(ctx, *configPath, cfg, logger, monitor, hub, redactor, level)
+	manager, err := gateway.NewRuntimeManager(ctx, *configPath, cfg, logger, monitor, redactor, level)
 	if err != nil {
 		logger.Error("failed to initialize runtime", "component", "runtime", "event", "runtime_initialization_failed", "error", err)
 		os.Exit(1)
@@ -57,34 +51,25 @@ func main() {
 	defer manager.Shutdown()
 
 	apiServer := &http.Server{
-		Addr: cfg.Listen, Handler: manager.Handler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second,
+		Addr:              cfg.Listen,
+		Handler:           manager.Handler(),
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
-	servers := []*http.Server{apiServer}
-	go serveHTTP(cancel, logger, apiServer, "api")
-
-	if cfg.WebUI.Enabled {
-		admin := adminui.New(manager, monitor, hub, logger)
-		webServer := &http.Server{
-			Addr: cfg.WebUI.Listen, Handler: admin.Handler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second,
-		}
-		servers = append(servers, webServer)
-		go serveHTTP(cancel, logger, webServer, "webui")
-	}
+	go serveHTTP(cancel, logger, apiServer)
 
 	<-ctx.Done()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shutdownCancel()
-	for _, server := range servers {
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			logger.Error("graceful shutdown failed", "component", "server", "event", "shutdown_failed", "address", server.Addr, "error", err)
-		}
+	if err := apiServer.Shutdown(shutdownCtx); err != nil {
+		logger.Error("graceful shutdown failed", "component", "server", "event", "shutdown_failed", "address", apiServer.Addr, "error", err)
 	}
 }
 
-func serveHTTP(cancel context.CancelFunc, logger *slog.Logger, server *http.Server, component string) {
-	logger.Info("server listening", "component", component, "event", "server_started", "address", server.Addr, "version", buildinfo.Version)
+func serveHTTP(cancel context.CancelFunc, logger *slog.Logger, server *http.Server) {
+	logger.Info("server listening", "component", "api", "event", "server_started", "address", server.Addr, "version", buildinfo.Version)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logger.Error("server stopped unexpectedly", "component", component, "event", "server_failed", "address", server.Addr, "error", err)
+		logger.Error("server stopped unexpectedly", "component", "api", "event", "server_failed", "address", server.Addr, "error", err)
 		cancel()
 	}
 }

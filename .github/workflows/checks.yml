@@ -36,16 +36,13 @@ jobs:
         run: go build -trimpath ./cmd/opencode2api
 
   format:
-    name: Formatting and WebUI syntax
+    name: Go formatting
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
       - name: Check Go formatting
         shell: bash
         run: |
@@ -54,11 +51,5 @@ jobs:
             printf '%s\n' "$unformatted"
             exit 1
           fi
-      - name: Check WebUI syntax
-        shell: bash
-        run: |
-          for f in webui/js/*.js webui/js/pages/*.js; do
-            node --input-type=module --check < "$f" || { echo "syntax error: $f" >&2; exit 1; }
-          done
       - name: Check container entrypoint syntax
         run: sh -n docker-entrypoint.sh

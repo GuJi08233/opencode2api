@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"opencode2api/internal/config"
 	"opencode2api/internal/identity"
 	"opencode2api/internal/jsonutil"
 	"opencode2api/internal/models"
@@ -22,19 +21,17 @@ type probeResult struct {
 	effort                             models.EffortProbe
 }
 
-func (g *Gateway) resolvedEffort(model string, tier config.Tier, protocol wire.Protocol) string {
+func (g *Gateway) resolvedEffort(model string, protocol wire.Protocol) string {
 	effort := g.cfg.ForcedEffort(model)
 	if effort != "auto" {
 		return effort
 	}
-	// Only the free Zen lane is actively probed. Never transfer observations
-	// to a different protocol/tier, or guess a level for an unprobed model.
-	if tier != config.TierZen || protocol == wire.SystemOne || g.availability == nil || !g.catalog.IsFreeModel(model) {
+	if protocol == wire.SystemOne || g.availability == nil || !g.catalog.IsFreeModel(model) {
 		return ""
 	}
 	item := g.availability.Get(model)
-	if !g.catalog.MetadataForTier(model, tier).Reasoning || item.AutoEffort.Effort == "none" {
-		return "" // Do not inject reasoning into a model that only accepted the baseline.
+	if !g.catalog.MetadataFor(model).Reasoning || item.AutoEffort.Effort == "none" {
+		return ""
 	}
 	if item.Disabled || item.AutoEffort.Protocol != string(protocol) || time.Since(item.EffortCheckedAt) > 2*models.FreeModelCheckInterval {
 		return ""
@@ -44,7 +41,6 @@ func (g *Gateway) resolvedEffort(model string, tier config.Tier, protocol wire.P
 
 func probePayload(model string, protocol wire.Protocol, effort string, legacy bool) ([]byte, error) {
 	if protocol == wire.SystemOne {
-		// TypeSafe's native boolean type is "noul", not JSON Schema boolean.
 		return json.Marshal(map[string]any{"model": model, "state": "1 + 1 = 2", "questions": map[string]any{
 			"arithmetic": map[string]any{"type": "noul", "instructions": "Is 1 + 1 equal to 2?"},
 		}})
@@ -69,30 +65,24 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 	if !g.catalog.IsFreeModel(model) {
 		return probeResult{reason: "not_free"}
 	}
-	d := g.catalog.Diagnostic(model, wire.Chat, g.zenNodes.Len() > 0, false, g.cfg.Anonymous)
-	protocol := d.NativeProtocols[config.TierZen]
-	if !d.AvailableZen || !g.catalog.Supported(model) {
+	if !g.catalog.Supported(model) {
 		return probeResult{reason: "unsupported_probe"}
 	}
+	route, err := g.catalog.RouteForProbe(model)
+	if err != nil {
+		return probeResult{reason: "unsupported_probe"}
+	}
+	protocol := route.Protocol
 	ids := identity.RequestIDs{Session: identity.CanonicalSessionID("availability:" + model), Project: "opencode2api:default-project"}
 	type lane struct {
 		key, name, baseURL string
 		client             *http.Client
 	}
 	var lanes []lane
-	if g.cfg.Anonymous {
-		cursor := g.anonymous.CursorFor(ids.Session)
-		if node := cursor.Next(); node != nil {
-			// Prefer the legacy /zen/v1 lane before falling back to /inference.
-			for _, baseURL := range g.anonymousUpstreams() {
-				lanes = append(lanes, lane{anonymousZenKey, "anonymous", baseURL, node.proxy.client})
-			}
-		}
-	}
-	cursor := g.zenNodes.CursorFor(ids.Session)
+	cursor := g.anonymous.CursorFor(ids.Session)
 	if node := cursor.Next(); node != nil {
-		if proxy := g.zenNodes.Proxy(node); proxy != nil {
-			lanes = append(lanes, lane{node.key, "zen", g.cfg.Upstream.Zen, proxy.client})
+		for _, baseURL := range g.anonymousUpstreams() {
+			lanes = append(lanes, lane{anonymousZenKey, "anonymous", baseURL, node.proxy.client})
 		}
 	}
 	result := probeResult{reason: "no_probe_channel"}
@@ -108,12 +98,11 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 		result.channel = lane.name
 		if result.success {
 			if g.cfg.ForcedEffort(model) == "auto" && protocol != wire.SystemOne {
-				if !g.catalog.MetadataForTier(model, config.TierZen).Reasoning {
+				if !g.catalog.MetadataFor(model).Reasoning {
 					result.effort = models.EffortProbe{Effort: "none", Protocol: string(protocol)}
 				} else {
 					for _, effort := range []string{"max", "xhigh", "high", "medium", "low", "minimal", "none"} {
 						if effort == "none" {
-							// Baseline already succeeded without an effort field.
 							result.effort = models.EffortProbe{Effort: "none", Protocol: string(protocol)}
 							break
 						}
@@ -122,13 +111,9 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 							result.effort = models.EffortProbe{Effort: effort, Protocol: string(protocol)}
 							break
 						}
-						// A rate limit or timeout gives no evidence that a lower
-						// reasoning level is required. Keep previous observations.
 						if !trial.effortRejected {
 							break
 						}
-						// Once higher levels were explicitly rejected, do not
-						// retain an older ceiling if the next trial is inconclusive.
 						result.effort = models.EffortProbe{Reset: true}
 					}
 				}
@@ -139,7 +124,6 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 			inconclusive = result.reason
 		}
 	}
-	// One lane's auth/transient failure cannot establish global unavailability.
 	if inconclusive != "" {
 		result.reason = inconclusive
 	}

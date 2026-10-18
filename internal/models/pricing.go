@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"opencode2api/internal/httpx"
@@ -62,11 +63,15 @@ type modelMetadataCache struct {
 	Models    map[string]Price `json:"models"`
 }
 
+type pricingState struct {
+	models    map[string]Price
+	updatedAt time.Time
+	lastError string
+}
+
 type PricingStore struct {
-	mu             sync.RWMutex
-	models         map[string]Price
-	updatedAt      time.Time
-	lastError      string
+	mu             sync.Mutex
+	state          atomic.Pointer[pricingState]
 	cachePath      string
 	endpoint       string
 	client         *http.Client
@@ -80,11 +85,15 @@ func NewPricingStore(configPath string, logger *slog.Logger) *PricingStore {
 		cachePath = configPath + ".models.dev.json"
 	}
 	store := &PricingStore{
-		models: make(map[string]Price), cachePath: cachePath, endpoint: modelsDevDefaultURL,
+		cachePath: cachePath, endpoint: modelsDevDefaultURL,
 		client: &http.Client{Timeout: modelsDevTimeout}, logger: logger,
 	}
+	store.state.Store(&pricingState{models: make(map[string]Price)})
 	if err := store.loadCache(); err != nil && !errors.Is(err, os.ErrNotExist) {
-		store.lastError = "load metadata cache: " + err.Error()
+		cur := store.state.Load()
+		next := *cur
+		next.lastError = "load metadata cache: " + err.Error()
+		store.state.Store(&next)
 	}
 	return store
 }
@@ -99,9 +108,9 @@ func (store *PricingStore) SetClientProvider(provider func() []*http.Client) {
 }
 
 func (store *PricingStore) refreshClients() []*http.Client {
-	store.mu.RLock()
+	store.mu.Lock()
 	provider := store.clientProvider
-	store.mu.RUnlock()
+	store.mu.Unlock()
 	if provider == nil {
 		return []*http.Client{store.client}
 	}
@@ -160,7 +169,7 @@ func (store *PricingStore) Refresh(ctx context.Context) error {
 			}
 		}
 		store.mu.Lock()
-		store.models, store.updatedAt, store.lastError = models, now, ""
+		store.state.Store(&pricingState{models: models, updatedAt: now})
 		store.mu.Unlock()
 		return nil
 	}
@@ -192,16 +201,18 @@ func (store *PricingStore) fetch(ctx context.Context, client *http.Client) ([]by
 
 func (store *PricingStore) recordError(err error) error {
 	store.mu.Lock()
-	store.lastError = err.Error()
+	cur := store.state.Load()
+	next := *cur
+	next.lastError = err.Error()
+	store.state.Store(&next)
 	store.mu.Unlock()
 	return err
 }
 
 func (store *PricingStore) Decide(model string) AnonymousDecision {
-	store.mu.RLock()
-	price, exists := store.models[model]
-	ready := !store.updatedAt.IsZero() && len(store.models) > 0
-	store.mu.RUnlock()
+	st := store.state.Load()
+	price, exists := st.models[model]
+	ready := !st.updatedAt.IsZero() && len(st.models) > 0
 	nameFree := isFreeModel(model)
 	fallback := func(source string) AnonymousDecision {
 		if nameFree {
@@ -245,18 +256,16 @@ func (store *PricingStore) Decide(model string) AnonymousDecision {
 }
 
 func (store *PricingStore) Price(model string) (Price, bool) {
-	store.mu.RLock()
-	defer store.mu.RUnlock()
-	price, ok := store.models[model]
+	st := store.state.Load()
+	price, ok := st.models[model]
 	return price, ok
 }
 
 func (store *PricingStore) Snapshot() MetadataSnapshot {
-	store.mu.RLock()
-	defer store.mu.RUnlock()
-	snapshot := MetadataSnapshot{Ready: !store.updatedAt.IsZero() && len(store.models) > 0, Models: len(store.models), LastError: store.lastError, CachePath: store.cachePath}
-	if !store.updatedAt.IsZero() {
-		updated := store.updatedAt.UTC()
+	st := store.state.Load()
+	snapshot := MetadataSnapshot{Ready: !st.updatedAt.IsZero() && len(st.models) > 0, Models: len(st.models), LastError: st.lastError, CachePath: store.cachePath}
+	if !st.updatedAt.IsZero() {
+		updated := st.updatedAt.UTC()
 		next := updated.Add(modelsDevRefresh)
 		snapshot.UpdatedAt, snapshot.NextRefresh = &updated, &next
 		snapshot.Stale = time.Since(updated) > modelsDevRefresh
@@ -281,7 +290,7 @@ func (store *PricingStore) loadCache() error {
 	if cache.UpdatedAt.IsZero() || len(cache.Models) == 0 {
 		return errors.New("metadata cache is empty or missing updated_at")
 	}
-	store.models, store.updatedAt = cache.Models, cache.UpdatedAt.UTC()
+	store.state.Store(&pricingState{models: cache.Models, updatedAt: cache.UpdatedAt.UTC()})
 	return nil
 }
 
@@ -319,8 +328,6 @@ func decodeModelsDev(data []byte) (map[string]Price, error) {
 		for id, raw := range jsonutil.MapAt(provider, "models") {
 			model, _ := raw.(map[string]any)
 			modelID := jsonutil.FirstString(jsonutil.StringAt(model, "id"), id)
-			// Providers are sorted with OpenCode first, so keep its metadata
-			// for duplicate model IDs and use other OpenCode tiers to fill gaps.
 			if _, exists := result[modelID]; exists {
 				continue
 			}

@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"strings"
 
-	"opencode2api/internal/config"
 	"opencode2api/internal/httpx"
 	wire "opencode2api/internal/protocol"
 )
@@ -18,7 +17,6 @@ import (
 const (
 	CapabilitiesURL = "https://models.opencode.ai/api.json"
 	ZenDocsURL      = "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/zen.mdx"
-	GoDocsURL       = "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/go.mdx"
 	// LegacyZenBase is the legacy /zen console origin (serving /zen/v1/*) that
 	// still serves anonymous inference and the models listing alongside the newer
 	// /inference backend.
@@ -28,9 +26,9 @@ const (
 var protocolDocEndpointPattern = regexp.MustCompile("\\|[^|]+\\|\\s*`?([^|`\\s]+)`?\\s*\\|\\s*`[^`]+/v1/(chat/completions|responses|messages|systemone)`")
 
 type Capabilities struct {
-	Protocols   map[config.Tier]map[string]wire.Protocol
-	Unsupported map[config.Tier]map[string]bool
-	Metadata    map[config.Tier]map[string]Metadata
+	Protocols   map[string]wire.Protocol
+	Unsupported map[string]bool
+	Metadata    map[string]Metadata
 }
 
 type capabilityProvider struct {
@@ -61,10 +59,6 @@ type capabilityModelLimit struct {
 	Output  int `json:"output"`
 }
 
-// Metadata carries the per-model capability fields surfaced through
-// /v1/models so consumers (harnesses like Pi or jcode) get real context
-// windows and feature flags from the catalog instead of guessing. It is
-// purely additive: routing does not depend on any of these fields.
 type Metadata struct {
 	ContextWindow    int      `json:"context_window,omitempty"`
 	MaxInput         int      `json:"max_input,omitempty"`
@@ -74,12 +68,9 @@ type Metadata struct {
 	StructuredOutput bool     `json:"structured_output,omitempty"`
 	InputModalities  []string `json:"input_modalities,omitempty"`
 	OutputModalities []string `json:"output_modalities,omitempty"`
-	// Cost is filled from models.dev at read time, in USD per million tokens.
-	Cost *Cost `json:"cost,omitempty"`
+	Cost             *Cost    `json:"cost,omitempty"`
 }
 
-// Cost is the published per-million-token price of a model. A nil field means
-// the metadata did not state it.
 type Cost struct {
 	Input      *float64 `json:"input,omitempty"`
 	Output     *float64 `json:"output,omitempty"`
@@ -109,10 +100,6 @@ type capabilityModelProvider struct {
 	NPM string `json:"npm"`
 }
 
-// fetchProtocolCapabilities reads OpenCode's machine-readable provider
-// catalog. Unlike /v1/models, this source includes the SDK selected for each
-// model, which is the upstream's protocol declaration. No model IDs are kept
-// in this project.
 func FetchCapabilities(ctx context.Context, client *http.Client, endpoint string) (Capabilities, error) {
 	if client == nil {
 		client = http.DefaultClient
@@ -137,13 +124,12 @@ func FetchCapabilities(ctx context.Context, client *http.Client, endpoint string
 		return Capabilities{}, err
 	}
 	result := Capabilities{
-		Protocols:   map[config.Tier]map[string]wire.Protocol{config.TierZen: {}, config.TierGo: {}},
-		Unsupported: map[config.Tier]map[string]bool{config.TierZen: {}, config.TierGo: {}},
-		Metadata:    map[config.Tier]map[string]Metadata{config.TierZen: {}, config.TierGo: {}},
+		Protocols:   map[string]wire.Protocol{},
+		Unsupported: map[string]bool{},
+		Metadata:    map[string]Metadata{},
 	}
 	for providerID, provider := range providers {
-		tier, ok := capabilityTier(providerID, provider.API)
-		if !ok {
+		if !isZenProvider(providerID, provider.API) {
 			continue
 		}
 		for modelID, model := range provider.Models {
@@ -155,35 +141,21 @@ func FetchCapabilities(ctx context.Context, client *http.Client, endpoint string
 				npm = model.Provider.NPM
 			}
 			if protocol, ok := protocolForSDK(npm); ok {
-				result.Protocols[tier][modelID] = protocol
+				result.Protocols[modelID] = protocol
 			} else {
-				result.Unsupported[tier][modelID] = true
+				result.Unsupported[modelID] = true
 			}
-			result.Metadata[tier][modelID] = model.metadata()
+			result.Metadata[modelID] = model.metadata()
 		}
 	}
-	// The machine catalog is the primary source. The upstream endpoint tables
-	// are a supplemental source for models whose provider inherits a default SDK
-	// but whose published endpoint is more specific (for example a Messages
-	// route). This remains data-driven: no model IDs are embedded here.
-	for _, doc := range []struct {
-		tier config.Tier
-		url  string
-	}{
-		{config.TierZen, ZenDocsURL},
-		{config.TierGo, GoDocsURL},
-	} {
-		protocols, err := FetchProtocolDocs(ctx, client, doc.url)
-		if err != nil {
-			continue
-		}
+	if protocols, err := FetchProtocolDocs(ctx, client, ZenDocsURL); err == nil {
 		for modelID, protocol := range protocols {
-			result.Protocols[doc.tier][modelID] = protocol
-			delete(result.Unsupported[doc.tier], modelID)
+			result.Protocols[modelID] = protocol
+			delete(result.Unsupported, modelID)
 		}
 	}
-	if len(result.Protocols[config.TierZen]) == 0 && len(result.Protocols[config.TierGo]) == 0 && len(result.Unsupported[config.TierZen]) == 0 && len(result.Unsupported[config.TierGo]) == 0 {
-		return Capabilities{}, errors.New("OpenCode capability endpoint returned no Zen or Go models")
+	if len(result.Protocols) == 0 && len(result.Unsupported) == 0 {
+		return Capabilities{}, errors.New("OpenCode capability endpoint returned no Zen models")
 	}
 	return result, nil
 }
@@ -238,15 +210,12 @@ func FetchProtocolDocs(ctx context.Context, client *http.Client, endpoint string
 	return result, nil
 }
 
-func capabilityTier(providerID, api string) (config.Tier, bool) {
+func isZenProvider(providerID, api string) bool {
 	value := strings.ToLower(strings.TrimSpace(providerID + " " + api))
 	if strings.Contains(value, "opencode-go") || strings.Contains(value, "/go/") {
-		return config.TierGo, true
+		return false
 	}
-	if strings.Contains(value, "opencode") || strings.Contains(value, "/zen/") {
-		return config.TierZen, true
-	}
-	return "", false
+	return strings.Contains(value, "opencode") || strings.Contains(value, "/zen/")
 }
 
 func protocolForSDK(npm string) (wire.Protocol, bool) {

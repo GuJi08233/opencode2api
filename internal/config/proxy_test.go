@@ -19,7 +19,6 @@ func TestParseProxyEntry(t *testing.T) {
 		{"socks5h://127.0.0.1:1080#pool", "socks5h://127.0.0.1:1080", true},
 		{"pool+http://127.0.0.1:7890", "http://127.0.0.1:7890", true},
 		{"pool+socks5://127.0.0.1:1080", "socks5://127.0.0.1:1080", true},
-		// A fragment that is not the pool marker belongs to the proxy URL.
 		{"http://127.0.0.1:7890#other", "http://127.0.0.1:7890#other", false},
 	}
 	for _, tc := range cases {
@@ -31,8 +30,6 @@ func TestParseProxyEntry(t *testing.T) {
 }
 
 func TestRedactURLKeepsPoolMarker(t *testing.T) {
-	// url.User("***") percent-escapes the asterisks; that is the existing
-	// RedactURL shape for every proxy, so the expectation mirrors it.
 	const masked = "http://%2A%2A%2A@127.0.0.1:7890#pool"
 	if got := RedactURL("http://user:pass@127.0.0.1:7890#pool"); got != masked {
 		t.Errorf("pool URL redacted as %q, want %q", got, masked)
@@ -45,8 +42,6 @@ func TestRedactURLKeepsPoolMarker(t *testing.T) {
 	}
 }
 
-// The same endpoint listed statically and as a pool is two distinct routes and
-// must survive deduplication; an exact repeat must not.
 func TestResolveProxyFilesKeepsPoolVariantOfSameEndpoint(t *testing.T) {
 	cfg := Config{Proxies: []string{
 		"http://127.0.0.1:7890",
@@ -68,20 +63,16 @@ func TestResolveProxyFilesKeepsPoolVariantOfSameEndpoint(t *testing.T) {
 	}
 }
 
-// A pool entry must validate against the clean URL, and its credentials must
-// stay redactable after the marker is stripped.
 func TestNormalizeAcceptsPoolProxy(t *testing.T) {
 	cfg := Config{
 		Listen:      "127.0.0.1:8080",
 		ServerKeys:  []string{"local-key"},
-		Anonymous:   true,
 		Proxies:     []string{"http://user:secret@127.0.0.1:7890#pool", "direct"},
-		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go", Anonymous: "https://opencode.ai/inference"},
+		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Anonymous: "https://opencode.ai/inference"},
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
 		Performance: PerformanceConfig{MaxIdleConns: 10, MaxIdleConnsPerHost: 10, IdleConnTimeoutSeconds: 30, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15},
-		Logging:     LoggingConfig{Level: "info", RingSize: 100},
-		Prefer:      TierGo,
+		Logging:     LoggingConfig{Level: "info"},
 	}
 	normalized, err := Normalize("config.json", cfg)
 	if err != nil {

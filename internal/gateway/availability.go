@@ -2,9 +2,6 @@ package gateway
 
 import (
 	"context"
-
-	"errors"
-
 	"time"
 
 	"opencode2api/internal/models"
@@ -22,38 +19,6 @@ func (m *RuntimeManager) AvailabilitySnapshot() []models.Availability {
 		}
 	}
 	return items
-}
-
-func (m *RuntimeManager) RestoreModel(model string) error {
-	m.updateMu.Lock()
-	defer m.updateMu.Unlock()
-	r := m.current.Load()
-	if r == nil {
-		return errors.New("gateway runtime is unavailable")
-	}
-	for _, item := range m.AvailabilitySnapshot() {
-		if item.Model == model {
-			return r.availability.Restore(model, time.Now().UTC())
-		}
-	}
-	return errors.New("unknown free model")
-}
-
-// SetManualModel switches a free model between manual and automatic control.
-// Manual models stay enabled and are excluded from automatic probing.
-func (m *RuntimeManager) SetManualModel(model string, manual bool) error {
-	m.updateMu.Lock()
-	defer m.updateMu.Unlock()
-	r := m.current.Load()
-	if r == nil {
-		return errors.New("gateway runtime is unavailable")
-	}
-	for _, item := range m.AvailabilitySnapshot() {
-		if item.Model == model {
-			return r.availability.SetManual(model, manual, time.Now().UTC())
-		}
-	}
-	return errors.New("unknown free model")
 }
 
 func (m *RuntimeManager) startAvailabilityChecks() {
@@ -93,7 +58,6 @@ func (m *RuntimeManager) checkFreeModels(ctx context.Context) {
 		if !result.attempted || ctx.Err() != nil {
 			continue
 		}
-		// Config changes may replace credentials or endpoints during a probe.
 		m.updateMu.Lock()
 		if m.current.Load() == r {
 			if err := r.availability.Record(item.Model, item.Generation, result.success, result.reason, result.channel, time.Now().UTC(), result.effort); err != nil {

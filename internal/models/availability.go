@@ -2,9 +2,11 @@ package models
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,70 +34,64 @@ type Availability struct {
 }
 
 type AvailabilityStore struct {
-	mu    sync.RWMutex
+	mu    sync.Mutex
 	path  string
-	items map[string]Availability
+	items atomic.Pointer[map[string]Availability]
 }
 
 func NewAvailabilityStore(path string) (*AvailabilityStore, error) {
-	s := &AvailabilityStore{path: path, items: map[string]Availability{}}
+	items := map[string]Availability{}
 	if path != "" {
 		b, err := os.ReadFile(path)
 		if err == nil {
-			if err = json.Unmarshal(b, &s.items); err != nil {
+			if err = json.Unmarshal(b, &items); err != nil {
 				return nil, err
 			}
 		} else if !os.IsNotExist(err) {
 			return nil, err
 		}
 	}
-	if s.items == nil {
-		s.items = map[string]Availability{}
+	if items == nil {
+		items = map[string]Availability{}
 	}
-	// Legacy probes used invalid session IDs and treated temporary errors as
-	// permanent failures. These records cannot establish model unavailability.
-	// The migration stays in memory and is re-derived on every load; the next
-	// explicit write persists it.
-	for model, item := range s.items {
+	for model, item := range items {
 		if item.ProbeVersion == 0 && item.Disabled {
 			item.Disabled = false
 			item.NextCheck = time.Time{}
 			item.Reason = "legacy_probe_recheck"
-			s.items[model] = item
+			items[model] = item
 		}
-		// Manual restores predate the manual lock flag. Preserve the
-		// operator's intent: a model left as manually_enabled stays under
-		// manual control instead of falling back under automatic probing.
 		if !item.Disabled && !item.Manual && item.Reason == "manually_enabled" {
 			item.Manual = true
-			s.items[model] = item
+			items[model] = item
 		}
 	}
+	s := &AvailabilityStore{path: path}
+	s.items.Store(&items)
 	return s, nil
 }
 
 func (s *AvailabilityStore) Get(model string) Availability {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	item := s.items[model]
+	items := *s.items.Load()
+	item := items[model]
 	item.Model = model
 	return item
 }
 
-func (s *AvailabilityStore) Disabled(model string) bool { return s.Get(model).Disabled }
+func (s *AvailabilityStore) Disabled(model string) bool {
+	items := *s.items.Load()
+	return items[model].Disabled
+}
 
-// SetManual switches a model between manual and automatic control. Manual
-// mode keeps the model enabled and excludes it from automatic probing;
-// switching back to automatic schedules a probe on the next check.
 func (s *AvailabilityStore) SetManual(model string, manual bool, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	item, existed := s.items[model]
-	// Retried requests must not erase disable evidence or reset the schedule.
+	cur := *s.items.Load()
+	item := cur[model]
 	if item.Manual == manual {
 		return nil
 	}
-	previous := item
+	next := maps.Clone(cur)
 	item.Model = model
 	item.Manual = manual
 	item.Generation++
@@ -108,20 +104,14 @@ func (s *AvailabilityStore) SetManual(model string, manual bool, now time.Time) 
 		item.Reason = "auto_probe"
 		item.NextCheck = time.Time{}
 	}
-	s.items[model] = item
-	if err := s.saveLocked(); err != nil {
-		if existed {
-			s.items[model] = previous
-		} else {
-			delete(s.items, model)
-		}
+	next[model] = item
+	if err := s.saveLocked(next); err != nil {
 		return err
 	}
+	s.items.Store(&next)
 	return nil
 }
 
-// A manual restore takes the model under manual control and invalidates
-// results from probes that were already running.
 func (s *AvailabilityStore) Restore(model string, now time.Time) error {
 	return s.SetManual(model, true, now)
 }
@@ -129,13 +119,9 @@ func (s *AvailabilityStore) Restore(model string, now time.Time) error {
 func (s *AvailabilityStore) Record(model string, generation uint64, success bool, reason, channel string, now time.Time, effort EffortProbe) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	item := s.items[model]
-	if item.Generation != generation {
-		return nil
-	}
-	// Manual control freezes the record: automatic probes must never
-	// overwrite a manually_enabled state (neither Disabled nor Reason).
-	if item.Manual {
+	cur := *s.items.Load()
+	item := cur[model]
+	if item.Generation != generation || item.Manual {
 		return nil
 	}
 	item.Model = model
@@ -144,18 +130,18 @@ func (s *AvailabilityStore) Record(model string, generation uint64, success bool
 	} else if reason == "model_unavailable" {
 		item.Disabled = true
 	} else if item.Disabled {
-		// An inconclusive recheck of a still-disabled model carries no new
-		// evidence. Keep the previous disable reason and backoff instead of
-		// resetting to an hourly retry with the transient error.
 		item.CheckedAt = now
 		item.ProbeVersion = 1
-		// A scheduled recheck has already reached NextCheck. Advance it to
-		// avoid probing on every scheduler tick after an inconclusive result.
 		if !item.NextCheck.After(now) {
 			item.NextCheck = now.Add(FailedModelCheckInterval)
 		}
-		s.items[model] = item
-		return s.saveLocked()
+		next := maps.Clone(cur)
+		next[model] = item
+		if err := s.saveLocked(next); err != nil {
+			return err
+		}
+		s.items.Store(&next)
+		return nil
 	}
 	item.CheckedAt, item.Reason, item.Channel = now, reason, channel
 	item.ProbeVersion = 1
@@ -169,15 +155,20 @@ func (s *AvailabilityStore) Record(model string, generation uint64, success bool
 		interval = FailedModelCheckInterval
 	}
 	item.NextCheck = now.Add(interval)
-	s.items[model] = item
-	return s.saveLocked()
+	next := maps.Clone(cur)
+	next[model] = item
+	if err := s.saveLocked(next); err != nil {
+		return err
+	}
+	s.items.Store(&next)
+	return nil
 }
 
-func (s *AvailabilityStore) saveLocked() error {
+func (s *AvailabilityStore) saveLocked(items map[string]Availability) error {
 	if s.path == "" {
 		return nil
 	}
-	b, err := json.MarshalIndent(s.items, "", "  ")
+	b, err := json.MarshalIndent(items, "", "  ")
 	if err != nil {
 		return err
 	}

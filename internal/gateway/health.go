@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"opencode2api/internal/buildinfo"
-	"opencode2api/internal/config"
 	"opencode2api/internal/httpx"
 	modelcatalog "opencode2api/internal/models"
 	wire "opencode2api/internal/protocol"
@@ -17,7 +16,6 @@ type healthResponse struct {
 	Ready   bool          `json:"ready"`
 	Version string        `json:"version"`
 	Models  healthModels  `json:"models"`
-	Keys    healthKeys    `json:"keys"`
 	Proxies healthProxies `json:"proxies"`
 	Issues  []string      `json:"issues,omitempty"`
 }
@@ -26,19 +24,10 @@ type healthModels struct {
 	Status            string     `json:"status"`
 	Total             int        `json:"total"`
 	Exposed           int        `json:"exposed"`
-	Zen               int        `json:"zen"`
-	Go                int        `json:"go"`
 	LastRefresh       *time.Time `json:"last_refresh,omitempty"`
 	StaleAfterSeconds int        `json:"stale_after_seconds"`
 	CacheSource       string     `json:"cache_source,omitempty"`
 	Stale             bool       `json:"stale"`
-}
-
-type healthKeys struct {
-	Zen       int  `json:"zen"`
-	Go        int  `json:"go"`
-	Total     int  `json:"total"`
-	Anonymous bool `json:"anonymous"`
 }
 
 type healthProxies struct {
@@ -50,12 +39,11 @@ type healthProxies struct {
 func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, models := g.availableModels()
 	proxyTotal, proxyHealthy := g.transports.healthCounts()
-	zenKeys, goKeys := g.zenNodes.Len(), g.goNodes.Len()
 	staleAfter := max(2*time.Duration(g.cfg.Models.RefreshSeconds)*time.Second, time.Minute)
 
 	modelStatus := "ready"
 	var lastRefresh *time.Time
-	issues := make([]string, 0, 3)
+	issues := make([]string, 0, 2)
 	if models.UpdatedAt.IsZero() {
 		modelStatus = "pending"
 		issues = append(issues, "model_catalog_pending")
@@ -69,9 +57,6 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			modelStatus = "stale"
 			issues = append(issues, "model_catalog_stale")
 		}
-	}
-	if zenKeys+goKeys == 0 && !g.cfg.Anonymous {
-		issues = append(issues, "no_upstream_keys")
 	}
 	if proxyHealthy == 0 {
 		issues = append(issues, "no_healthy_proxies")
@@ -98,14 +83,11 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			Status:            modelStatus,
 			Total:             models.Total,
 			Exposed:           models.Exposed,
-			Zen:               models.Zen,
-			Go:                models.Go,
 			LastRefresh:       lastRefresh,
 			StaleAfterSeconds: int(staleAfter / time.Second),
 			CacheSource:       models.CacheSource,
 			Stale:             models.Stale,
 		},
-		Keys: healthKeys{Zen: zenKeys, Go: goKeys, Total: zenKeys + goKeys, Anonymous: g.cfg.Anonymous},
 		Proxies: healthProxies{
 			Total:     proxyTotal,
 			Healthy:   proxyHealthy,
@@ -116,19 +98,14 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (g *Gateway) availableModels() ([]modelcatalog.Route, modelcatalog.CatalogSnapshot) {
-	return g.catalog.AvailableModels(g.zenNodes.Len() > 0, g.goNodes.Len() > 0, g.cfg.Anonymous)
+	return g.catalog.AvailableModels()
 }
 
-// reasoningLevels are the effort values the gateway accepts and forwards, from
-// lowest to highest. "auto" and "none" are gateway controls, not levels.
 var reasoningLevels = []string{"minimal", "low", "medium", "high", "xhigh", "max"}
 
-// reasoningEfforts lists the levels a reasoning model can be asked for. When an
-// "auto" probe has found the highest level the upstream accepts, the list stops
-// there so clients do not offer levels that would be rejected.
 func (g *Gateway) reasoningEfforts(model string, route modelcatalog.Route) []string {
 	if g.cfg.ForcedEffort(model) == "auto" {
-		if ceiling := slices.Index(reasoningLevels, g.resolvedEffort(model, route.Tier, route.Protocol)); ceiling >= 0 {
+		if ceiling := slices.Index(reasoningLevels, g.resolvedEffort(model, route.Protocol)); ceiling >= 0 {
 			return slices.Clone(reasoningLevels[:ceiling+1])
 		}
 	}
@@ -141,9 +118,7 @@ func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
 	data := make([]map[string]any, 0, len(routes))
 	for _, route := range routes {
 		model := route.ID
-		// Tier-scoped metadata: the advertised context window must match
-		// the tier that will serve the request (anonymous ⇒ Zen).
-		md := g.catalog.MetadataForTier(model, route.Tier)
+		md := g.catalog.MetadataFor(model)
 		entry := map[string]any{
 			"id": model, "object": "model", "created": now, "owned_by": "opencode",
 			"metadata":        md,
@@ -154,8 +129,6 @@ func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
 		} else {
 			entry["supported_endpoints"] = []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"}
 		}
-		// Top-level OpenAI-standard fields: discovery clients (jcode, Pi, …)
-		// read context/reasoning at the top level of each model entry.
 		if md.ContextWindow > 0 {
 			entry["context_window"] = md.ContextWindow
 			entry["context_length"] = md.ContextWindow
@@ -171,16 +144,13 @@ func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
 			entry["supports_reasoning"] = true
 			efforts := g.reasoningEfforts(model, route)
 			entry["reasoning_efforts"] = efforts
-			// OpenClaw and similar harnesses read effort levels from compat
-			// rather than inferring them, and otherwise offer only off/max.
 			entry["compat"] = map[string]any{"supportsReasoningEffort": true, "supportedReasoningEfforts": efforts}
-			if effort := g.resolvedEffort(model, route.Tier, route.Protocol); effort != "" && effort != "none" {
+			if effort := g.resolvedEffort(model, route.Protocol); effort != "" && effort != "none" {
 				entry["default_reasoning_effort"] = effort
 			}
 		}
 		if md.Cost != nil {
 			cost := map[string]any{}
-			// Camel-case aliases match OpenClaw's model cost shape.
 			for _, field := range []struct {
 				names []string
 				value *float64
@@ -206,22 +176,6 @@ func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
 			entry["structured_output"] = true
 		}
 		data = append(data, entry)
-	}
-	for _, group := range g.rotation.Snapshot().Groups {
-		if g.goNodes.Len() == 0 {
-			continue
-		}
-		available := false
-		for _, model := range group.Order {
-			if route, err := g.catalog.RouteForTier(model, config.TierGo, false, true); err == nil && route.Protocol != wire.SystemOne {
-				available = true
-				break
-			}
-		}
-		if !available {
-			continue
-		}
-		data = append(data, map[string]any{"id": group.Alias, "object": "model", "created": now, "owned_by": "opencode-go-rotation"})
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }

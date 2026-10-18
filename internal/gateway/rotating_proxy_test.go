@@ -287,19 +287,13 @@ func TestAnonymousRotatingProxyRetries(t *testing.T) {
 			g := &Gateway{
 				cfg:    config.Config{Retry: config.RetryConfig{MaxAttempts: 3, AnonymousMaxAttempts: tc.budget}, Upstream: config.UpstreamConfig{Anonymous: "http://upstream.invalid/inference"}},
 				logger: slog.New(slog.NewTextHandler(io.Discard, nil)), transports: pool,
-				anonymous: newAnonymousPool(true, pool, 15*time.Second, fresh),
+				anonymous: newAnonymousPool(pool, 15*time.Second, fresh),
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			if !fresh && !tc.pool {
-				// Static legacy behavior needs no background connectivity probe.
-				// Rotating cases use normal failure handling to verify that the
-				// gateway stays healthy and its anonymous node never cools down.
-				ctx = WithDiagnosticRequest(ctx)
-			}
-			route := models.Route{ID: "test-free", Tier: config.TierZen, Protocol: wire.Chat, Anonymous: true}
+			route := models.Route{ID: "test-free", Protocol: wire.Chat}
 			body := []byte(`{"model":"test-free","messages":[{"role":"user","content":"hello"}]}`)
-			resp, err, attempts := g.doAnonymousUpstream(ctx, route, map[config.Tier][]byte{config.TierZen: body}, identity.RequestIDs{}, 0)
+			resp, err, attempts := g.doAnonymousUpstream(ctx, route, body, identity.RequestIDs{}, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -332,7 +326,7 @@ func TestAnonymousRotatingProxyRetries(t *testing.T) {
 func TestAnonymousFixedExitStillCoolsDown(t *testing.T) {
 	proxy := &proxyTransport{}
 	proxy.healthy.Store(true)
-	pool := newAnonymousPool(true, &transportPool{items: []*proxyTransport{proxy}}, time.Second, true)
+	pool := newAnonymousPool(&transportPool{items: []*proxyTransport{proxy}}, time.Second, true)
 	node := pool.nodes[0]
 	pool.MarkFailure(node, &http.Response{StatusCode: 429, Header: make(http.Header)}, nil)
 	cursor := pool.CursorFor("")
@@ -341,11 +335,63 @@ func TestAnonymousFixedExitStillCoolsDown(t *testing.T) {
 	}
 }
 
+func TestReasoningRepairSharesAnonymousAttemptBudget(t *testing.T) {
+	for _, tc := range []struct {
+		budget, wantCalls, wantStatus int
+	}{
+		{budget: 1, wantCalls: 1, wantStatus: http.StatusBadRequest},
+		{budget: 2, wantCalls: 2, wantStatus: http.StatusBadRequest},
+		{budget: 3, wantCalls: 3, wantStatus: http.StatusOK},
+	} {
+		t.Run(strconv.Itoa(tc.budget), func(t *testing.T) {
+			calls := new(atomic.Int32)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch calls.Add(1) {
+				case 1:
+					w.WriteHeader(http.StatusBadRequest)
+					io.WriteString(w, `{"error":{"message":"reasoning item expired"}}`)
+				case 2:
+					w.WriteHeader(http.StatusTooManyRequests)
+					io.WriteString(w, `{"error":{"message":"rate limited"}}`)
+				default:
+					io.WriteString(w, `{"ok":true}`)
+				}
+			}))
+			defer upstream.Close()
+			pool, err := newTransportPool([]string{upstream.URL + "#pool"}, testPerformance(true), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pool.items[0].client.CloseIdleConnections()
+			g := &Gateway{
+				cfg: config.Config{
+					Retry:    config.RetryConfig{MaxAttempts: 3, AnonymousMaxAttempts: tc.budget},
+					Upstream: config.UpstreamConfig{Zen: "http://upstream.invalid/zen", Anonymous: "http://upstream.invalid/inference"},
+				},
+				logger: slog.New(slog.NewTextHandler(io.Discard, nil)), transports: pool,
+				anonymous: newAnonymousPool(pool, time.Second, true),
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			resp, err := g.doUpstream(ctx, models.Route{ID: "test-free", Protocol: wire.Responses},
+				[]byte(`{"model":"test-free","previous_response_id":"rs_old","input":[{"role":"user","content":"hello"}]}`), identity.RequestIDs{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if int(calls.Load()) != tc.wantCalls || resp.StatusCode != tc.wantStatus {
+				t.Fatalf("calls=%d status=%d, want calls=%d status=%d", calls.Load(), resp.StatusCode, tc.wantCalls, tc.wantStatus)
+			}
+		})
+	}
+}
+
 func TestAnonymousCursorSkipsCoolingFixedExitBesidePool(t *testing.T) {
 	fixed, rotating := &proxyTransport{}, &proxyTransport{pool: true}
 	fixed.healthy.Store(true)
 	rotating.healthy.Store(true)
-	pool := newAnonymousPool(true, &transportPool{items: []*proxyTransport{fixed, rotating}}, time.Second, false)
+	pool := newAnonymousPool(&transportPool{items: []*proxyTransport{fixed, rotating}}, time.Second, false)
 	quota := &http.Response{StatusCode: http.StatusTooManyRequests, Header: make(http.Header)}
 	pool.MarkFailure(pool.nodes[0], quota, nil)
 	pool.MarkFailure(pool.nodes[1], quota, nil)

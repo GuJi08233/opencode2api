@@ -13,66 +13,60 @@ import (
 	"sync"
 	"time"
 
-	"opencode2api/internal/config"
 	wire "opencode2api/internal/protocol"
 )
 
-const modelCatalogCacheSchemaVersion = 3
+const modelCatalogCacheSchemaVersion = 4
 
 var modelCatalogCacheWriteMu sync.Mutex
 
 type modelCatalogCache struct {
-	SchemaVersion   int                                      `json:"schema_version"`
-	UpdatedAt       time.Time                                `json:"updated_at"`
-	Zen             []string                                 `json:"zen"`
-	Go              []string                                 `json:"go"`
-	NativeProtocols map[config.Tier]map[string]wire.Protocol `json:"native_protocols"`
-	Unsupported     map[config.Tier]map[string]bool          `json:"unsupported"`
-	Metadata        map[config.Tier]map[string]Metadata      `json:"metadata,omitempty"`
+	SchemaVersion   int                      `json:"schema_version"`
+	UpdatedAt       time.Time                `json:"updated_at"`
+	Zen             []string                 `json:"zen"`
+	NativeProtocols map[string]wire.Protocol `json:"native_protocols"`
+	Unsupported     map[string]bool          `json:"unsupported"`
+	Metadata        map[string]Metadata      `json:"metadata,omitempty"`
 }
 
-// LoadCache installs a validated disk snapshot into a catalog. It deliberately
-// changes only discovered state; configured protocol overrides and routing
-// preferences stay owned by the current Config.
 func (c *Catalog) LoadCache(path string) error {
 	cache, err := loadModelCatalogCache(path)
 	if err != nil {
 		return err
 	}
 	c.mu.Lock()
-	c.zen = toSet(cache.Zen)
-	c.goModels = toSet(cache.Go)
-	c.nativeProtocols = cloneTierProtocols(cache.NativeProtocols)
-	c.unsupported = cloneTierBools(cache.Unsupported)
-	c.modelMeta = cloneModelMeta(cache.Metadata)
-	c.updatedAt = cache.UpdatedAt.UTC()
-	c.cacheSource = "disk"
-	c.stale = true
 	if c.cachePath == "" {
 		c.cachePath = path
 	}
+	c.state.Store(&catalogState{
+		zen:             toSet(cache.Zen),
+		nativeProtocols: cloneProtocols(cache.NativeProtocols),
+		unsupported:     cloneBools(cache.Unsupported),
+		modelMeta:       cloneMetadataMap(cache.Metadata),
+		sortedIDs:       cache.Zen,
+		updatedAt:       cache.UpdatedAt.UTC(),
+		cacheSource:     "disk",
+		stale:           true,
+	})
 	c.mu.Unlock()
 	return nil
 }
 
-// SaveCache snapshots only public model capability data. Credentials and
-// proxy configuration are not part of modelCatalog and can never enter this
-// file.
 func (c *Catalog) SaveCache() error {
 	c.mu.RLock()
 	path := c.cachePath
-	cache := modelCatalogCache{
-		SchemaVersion:   modelCatalogCacheSchemaVersion,
-		UpdatedAt:       c.updatedAt.UTC(),
-		Zen:             sortedSetKeys(c.zen),
-		Go:              sortedSetKeys(c.goModels),
-		NativeProtocols: cloneTierProtocols(c.nativeProtocols),
-		Unsupported:     cloneTierBools(c.unsupported),
-		Metadata:        cloneModelMeta(c.modelMeta),
-	}
 	c.mu.RUnlock()
 	if path == "" {
 		return nil
+	}
+	s := c.state.Load()
+	cache := modelCatalogCache{
+		SchemaVersion:   modelCatalogCacheSchemaVersion,
+		UpdatedAt:       s.updatedAt.UTC(),
+		Zen:             append([]string(nil), s.sortedIDs...),
+		NativeProtocols: cloneProtocols(s.nativeProtocols),
+		Unsupported:     cloneBools(s.unsupported),
+		Metadata:        cloneMetadataMap(s.modelMeta),
 	}
 	return saveModelCatalogCache(path, cache)
 }
@@ -112,15 +106,21 @@ func loadModelCatalogCache(path string) (modelCatalogCache, error) {
 		return modelCatalogCache{}, errors.New("model catalog cache is missing updated_at")
 	}
 	cache.Zen = normalizeModelIDs(cache.Zen)
-	cache.Go = normalizeModelIDs(cache.Go)
-	if len(cache.Zen) == 0 && len(cache.Go) == 0 {
+	if len(cache.Zen) == 0 {
 		return modelCatalogCache{}, errors.New("model catalog cache is empty")
 	}
-	if err := validateCatalogCapabilities(cache.NativeProtocols, cache.Unsupported); err != nil {
-		return modelCatalogCache{}, err
+	for model, protocol := range cache.NativeProtocols {
+		if model == "" || !wire.Valid(protocol) {
+			return modelCatalogCache{}, fmt.Errorf("model catalog cache contains invalid protocol for %q", model)
+		}
 	}
-	cache.NativeProtocols = cloneTierProtocols(cache.NativeProtocols)
-	cache.Unsupported = cloneTierBools(cache.Unsupported)
+	for model := range cache.Unsupported {
+		if strings.TrimSpace(model) == "" {
+			return modelCatalogCache{}, errors.New("model catalog cache contains an empty unsupported model")
+		}
+	}
+	cache.NativeProtocols = cloneProtocols(cache.NativeProtocols)
+	cache.Unsupported = cloneBools(cache.Unsupported)
 	cache.UpdatedAt = cache.UpdatedAt.UTC()
 	return cache, nil
 }
@@ -141,30 +141,6 @@ func normalizeModelIDs(items []string) []string {
 	}
 	sort.Strings(result)
 	return result
-}
-
-func validateCatalogCapabilities(native map[config.Tier]map[string]wire.Protocol, unsupported map[config.Tier]map[string]bool) error {
-	for tier, protocols := range native {
-		if tier != config.TierZen && tier != config.TierGo {
-			return fmt.Errorf("model catalog cache contains unknown tier %q", tier)
-		}
-		for model, protocol := range protocols {
-			if model == "" || !wire.Valid(protocol) {
-				return fmt.Errorf("model catalog cache contains invalid protocol for %q", model)
-			}
-		}
-	}
-	for tier, models := range unsupported {
-		if tier != config.TierZen && tier != config.TierGo {
-			return fmt.Errorf("model catalog cache contains unknown tier %q", tier)
-		}
-		for model := range models {
-			if strings.TrimSpace(model) == "" {
-				return errors.New("model catalog cache contains an empty unsupported model")
-			}
-		}
-	}
-	return nil
 }
 
 func saveModelCatalogCache(path string, cache modelCatalogCache) error {

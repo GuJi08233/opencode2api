@@ -5,8 +5,6 @@
 !internal/**
 !go.mod
 !go.sum
-!webui/
-!webui/**
 !config.example.json
 !docker-entrypoint.sh
 !Dockerfile

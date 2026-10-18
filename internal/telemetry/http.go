@@ -12,38 +12,17 @@ import (
 )
 
 type RequestMeta struct {
-	ModelAlias string
-	Model      string
-	Tier       string
-	Protocol   protocol.Protocol
-	Request    string
-	// Session is the canonical upstream session (ses_...). All turns of one
-	// conversation share it, so per-session token burn is visible in logs
-	// and monitoring: every session draws from the same upstream IP bucket
-	// on the anonymous lane.
-	Session   string
-	KeyID     string
-	Channel   string
-	Anonymous bool
-	Proxy     string
-	Attempts  int
-	Legs      []string
-	Stop      string
-	Tail      string
-	Stream    bool
-	// ServerKeyID is the fingerprint of the local server key the caller
-	// authenticated with, so usage can be split per caller. KeyID is the
-	// upstream account that served the request.
-	ServerKeyID string
-	// Shaped marks a key-tier free-model request whose wire body was
-	// normalized to agent shape (stream + required tools) like the anonymous
-	// lane. Non-streaming responses for shaped requests arrive as SSE
-	// and must be collapsed like anonymous ones.
-	Shaped bool
-	// ToolAlias holds the client's original read-related tool name (e.g.
-	// "reAd" or "read_file") when the legacy /zen/v1 shaper renamed it to
-	// "read" on the outbound wire. When non-empty, "read" tool calls in the
-	// upstream response are rewritten back to ToolAlias before returning.
+	Model          string
+	Protocol       protocol.Protocol
+	Request        string
+	Session        string
+	Proxy          string
+	Attempts       int
+	Legs           []string
+	Stop           string
+	Tail           string
+	Stream         bool
+	ServerKeyID    string
 	ToolAlias      string
 	Usage          protocol.Usage
 	UsageReported  bool
@@ -51,18 +30,12 @@ type RequestMeta struct {
 	Outcome        string
 }
 
-// PlaygroundServerKey buckets admin Playground traffic, which authenticates
-// with whichever server key is enabled first and is not that caller's usage.
-const PlaygroundServerKey = "playground"
-
 type requestMetaKey struct{}
 
-// WithRequestMeta shares request-local outcomes across HTTP and gateway layers.
 func WithRequestMeta(ctx context.Context, meta *RequestMeta) context.Context {
 	return context.WithValue(ctx, requestMetaKey{}, meta)
 }
 
-// MetaFromContext returns the request-local trace, or nil when it is absent.
 func MetaFromContext(ctx context.Context) *RequestMeta {
 	meta, _ := ctx.Value(requestMetaKey{}).(*RequestMeta)
 	return meta
@@ -96,7 +69,9 @@ func (w *statusWriter) Write(data []byte) (int, error) {
 }
 
 func (w *statusWriter) Flush() {
-	_ = http.NewResponseController(w.ResponseWriter).Flush()
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
@@ -108,37 +83,56 @@ func Middleware(monitor *Monitor, logger *slog.Logger, next http.Handler) http.H
 			return
 		}
 		started := time.Now()
-		meta := MetaFromRequest(r)
-		if meta == nil {
-			meta = &RequestMeta{}
-			r = r.WithContext(WithRequestMeta(r.Context(), meta))
-		}
+		meta := &RequestMeta{}
+		r = r.WithContext(WithRequestMeta(r.Context(), meta))
 		writer := &statusWriter{ResponseWriter: w}
-		monitor.active.Add(1)
+		if monitor != nil {
+			monitor.active.Add(1)
+		}
 		defer func() {
-			monitor.active.Add(-1)
+			if monitor != nil {
+				monitor.active.Add(-1)
+			}
 			status := writer.status
 			if status == 0 {
 				status = http.StatusOK
 			}
 			duration := time.Since(started)
-			monitor.Record(r.URL.Path, status, duration, meta)
+			if monitor != nil {
+				monitor.Record(status, meta)
+			}
 			outcome := meta.Outcome
 			if outcome == "" {
-				outcome = requestOutcome(status, meta.Channel)
+				outcome = requestOutcome(status, meta.Attempts > 0)
 			}
-			if meta.Channel != "" {
+			if meta.Attempts > 0 {
 				logger.Info("request routed", "component", "http", "event", "request_routed", "method", r.Method,
 					"path", r.URL.Path, "status", status, "duration_ms", duration.Milliseconds(), "request_id", meta.Request,
-					"model", meta.Model, "model_alias", meta.ModelAlias, "session", meta.Session, "server_key_id", meta.ServerKeyID, "tier", meta.Tier, "key_id", meta.KeyID,
-					"channel", meta.Channel, "anonymous", meta.Anonymous, "attempts", meta.Attempts, "legs", strings.Join(meta.Legs, " "), "stream", meta.Stream, "outcome", outcome,
+					"model", meta.Model, "session", meta.Session, "server_key_id", meta.ServerKeyID,
+					"proxy", meta.Proxy, "attempts", meta.Attempts, "legs", strings.Join(meta.Legs, " "), "stream", meta.Stream, "outcome", outcome,
 					"stop", meta.Stop, "in", meta.Usage.Input, "out", meta.Usage.Output, "reasoning_tokens", meta.Usage.Reasoning, "cached", meta.Usage.Cached, "tail", meta.Tail)
+			} else if logger.Enabled(r.Context(), slog.LevelDebug) {
+				logger.Debug("request completed", "component", "http", "event", "request_complete", "method", r.Method,
+					"path", r.URL.Path, "status", status, "duration_ms", duration.Milliseconds(), "bytes", writer.bytes,
+					"request_id", meta.Request, "model", meta.Model, "outcome", outcome)
 			}
-			logger.Debug("request completed", "component", "http", "event", "request_complete", "method", r.Method,
-				"path", r.URL.Path, "status", status, "duration_ms", duration.Milliseconds(), "bytes", writer.bytes,
-				"request_id", meta.Request, "model", meta.Model, "model_alias", meta.ModelAlias, "tier", meta.Tier, "key_id", meta.KeyID,
-				"channel", meta.Channel, "anonymous", meta.Anonymous, "attempts", meta.Attempts, "stream", meta.Stream, "outcome", outcome)
 		}()
 		next.ServeHTTP(writer, r)
 	})
+}
+
+func requestOutcome(status int, routed bool) string {
+	if !routed {
+		return "not_routed"
+	}
+	if status >= 200 && status < 400 {
+		return "success"
+	}
+	if status >= 400 && status < 500 {
+		return "client_error"
+	}
+	if status >= 500 {
+		return "server_error"
+	}
+	return "unknown"
 }

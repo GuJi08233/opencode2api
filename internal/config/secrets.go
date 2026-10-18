@@ -46,14 +46,9 @@ func NewSecretRedactor() *SecretRedactor {
 }
 
 func (r *SecretRedactor) Replace(cfg Config) {
-	values := make([]string, 0, len(cfg.ServerKeys)+len(cfg.ZenKeys)+len(cfg.GoKeys)+2)
+	values := make([]string, 0, len(cfg.ServerKeys)+len(cfg.RuntimeProxies())*2+4)
 	values = append(values, cfg.ServerKeys...)
-	values = append(values, cfg.ZenKeys...)
-	values = append(values, cfg.GoKeys...)
-	if cfg.WebUI.Password != "" {
-		values = append(values, cfg.WebUI.Password)
-	}
-	for _, value := range []string{cfg.Upstream.Zen, cfg.Upstream.Go, cfg.Upstream.Anonymous} {
+	for _, value := range []string{cfg.Upstream.Zen, cfg.Upstream.Anonymous} {
 		if parsed, err := url.Parse(value); err == nil && parsed.User != nil {
 			values = append(values, value, parsed.User.Username())
 			if password, ok := parsed.User.Password(); ok {
@@ -78,8 +73,9 @@ func (r *SecretRedactor) Replace(cfg Config) {
 }
 
 func (r *SecretRedactor) String(value string) string {
-	for _, secret := range r.values.Load().([]string) {
-		if len(secret) >= 4 {
+	secrets, _ := r.values.Load().([]string)
+	for _, secret := range secrets {
+		if len(secret) >= 4 && strings.Contains(value, secret) {
 			value = strings.ReplaceAll(value, secret, "***")
 		}
 	}
@@ -89,15 +85,4 @@ func (r *SecretRedactor) String(value string) string {
 func Fingerprint(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])[:10]
-}
-
-// keyDisplayID is intentionally separate from secretFingerprint. The latter
-// is an internal stable identifier used by session/config bookkeeping; this
-// value is safe for logs and the operator UI and shows only the key suffix.
-func KeyDisplayID(value string) string {
-	runes := []rune(value)
-	if len(runes) <= 5 {
-		return string(runes)
-	}
-	return string(runes[len(runes)-5:])
 }
