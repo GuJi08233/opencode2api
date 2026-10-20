@@ -309,6 +309,16 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	if g.anonymous.HasPool() && g.cfg.Retry.MaxAttempts > limit {
 		limit = g.cfg.Retry.MaxAttempts
 	}
+	// With no proxy node configured, the free tier still needs retries when the
+	// upstream itself is a reverse proxy (Upstream.Zen or Upstream.Anonymous
+	// pointing at one, e.g. a Resin route). Such a proxy picks its own egress
+	// per request, so a retry draws a fresh exit IP even though the gateway only
+	// has a single "direct" node to hand back. Without this, retry.max_attempts
+	// would be a no-op for the anonymous lane and a single 403 or 504 from the
+	// proxy would fail the whole request.
+	if limit < g.cfg.Retry.MaxAttempts && g.anonymous.Len() <= 1 {
+		limit = g.cfg.Retry.MaxAttempts
+	}
 	proxies := 0
 	attempts := 0
 	rawBody := bodies[config.TierZen]

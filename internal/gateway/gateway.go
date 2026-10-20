@@ -120,11 +120,33 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics) (*G
 		transports:     transports,
 		zenNodes:       zenNodes,
 		goNodes:        goNodes,
-		anonymous:      anonymousPool(cfg.Anonymous, transports, cooldown),
+		anonymous:      anonymousPool(cfg.Anonymous, transports, cooldown, anonymousTunnelsThroughProxy(cfg)),
 		catalog:        catalog,
 		monitor:        monitor,
 		attemptTimeout: attemptDeadline(cfg),
 	}, nil
+}
+
+// defaultAnonymousUpstream is the built-in v2 /inference origin the anonymous
+// lane falls back to when upstream.anonymous is unset. Config.Normalize writes
+// the same value, so this is only a comparison target.
+const defaultAnonymousUpstream = "https://opencode.ai/inference"
+
+// anonymousTunnelsThroughProxy reports whether the configured anonymous
+// upstreams leave the built-in OpenCode origins, which is what happens when an
+// operator points the free tier at a reverse proxy. Such a proxy chooses the
+// egress per request, so the anonymous lane must be allowed to redraw its
+// single direct node on retry (see anonymousPool).
+func anonymousTunnelsThroughProxy(cfg config.Config) bool {
+	zen := strings.TrimRight(strings.TrimSpace(cfg.Upstream.Zen), "/")
+	if zen != "" && !strings.EqualFold(zen, strings.TrimRight(models.V1Base, "/")) {
+		return true
+	}
+	anon := strings.TrimRight(strings.TrimSpace(cfg.Upstream.Anonymous), "/")
+	if anon != "" && !strings.EqualFold(anon, strings.TrimRight(defaultAnonymousUpstream, "/")) {
+		return true
+	}
+	return false
 }
 
 // Handler returns the gateway's HTTP API: the server-key authenticated /v1

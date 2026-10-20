@@ -53,6 +53,12 @@ type anonymousNodes struct {
 	next     atomic.Uint64
 	cooldown time.Duration
 	hasPool  bool
+	// retryThrough marks a pool whose single node is a plain direct dial to an
+	// anonymous upstream that is itself a reverse proxy. That proxy selects its
+	// own egress per request, so drawing the same node again is how the gateway
+	// obtains a fresh exit IP; without it the node would be handed out once and
+	// retry.max_attempts would never apply to the anonymous lane.
+	retryThrough bool
 }
 
 type anonymousNode struct {
@@ -72,8 +78,11 @@ type anonymousCursor struct {
 }
 
 // anonymousPool builds one anonymous node per proxy transport, or an empty
-// pool when the anonymous tier is disabled.
-func anonymousPool(enabled bool, transports *proxyTransports, cooldown time.Duration) *anonymousNodes {
+// pool when the anonymous tier is disabled. When the upstreams carry a
+// configured non-default origin — an operator pointing the free tier at a
+// reverse proxy — a lone direct node is marked retryThrough so retries draw a
+// fresh egress from that proxy instead of being capped at one attempt.
+func anonymousPool(enabled bool, transports *proxyTransports, cooldown time.Duration, tunnelThroughProxy bool) *anonymousNodes {
 	pool := &anonymousNodes{cooldown: cooldown}
 	if !enabled || transports == nil {
 		return pool
@@ -84,6 +93,9 @@ func anonymousPool(enabled bool, transports *proxyTransports, cooldown time.Dura
 			pool.hasPool = true
 		}
 		pool.nodes = append(pool.nodes, &anonymousNode{proxy: proxy})
+	}
+	if tunnelThroughProxy && !pool.hasPool && len(pool.nodes) == 1 && pool.nodes[0].proxy.name == "direct" {
+		pool.retryThrough = true
 	}
 	return pool
 }
@@ -141,17 +153,17 @@ func (c *anonymousCursor) Next() *anonymousNode {
 		idx := (c.start + c.offset) % n
 		c.offset++
 		node := c.pool.nodes[idx]
-		if node.proxy.pool || (!c.used[idx] && node.proxy.healthy.Load() && node.cooldownUntil.Load() <= now) {
+		if node.proxy.pool || c.pool.retryThrough || (!c.used[idx] && node.proxy.healthy.Load() && node.cooldownUntil.Load() <= now) {
 			c.used[idx] = true
 			return node
 		}
 	}
-	if c.pool.hasPool {
+	if c.pool.hasPool || c.pool.retryThrough {
 		for range n {
 			idx := (c.start + c.offset) % n
 			c.offset++
 			node := c.pool.nodes[idx]
-			if node.proxy.pool {
+			if node.proxy.pool || c.pool.retryThrough {
 				return node
 			}
 		}
@@ -226,6 +238,12 @@ const maxAnonymousRetryAfterMultiplier = 8
 // base cooldown up to 8x, and a longer Retry-After extends it up to that same
 // 8x ceiling.
 func (p *anonymousNodes) MarkFailure(node *anonymousNode, resp *http.Response, err error) {
+	if node != nil && p != nil && p.retryThrough {
+		// The egress is chosen by the reverse proxy in front of the upstream, not
+		// by this node, so a failure says nothing about the node itself. Cooling
+		// it would strand the tier with no drawable node at all.
+		return
+	}
 	if node == nil || (node.proxy != nil && node.proxy.pool) {
 		return
 	}
