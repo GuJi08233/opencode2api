@@ -293,7 +293,7 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 // doAnonymousUpstream walks the session's anonymous proxy cursor. Each static
 // proxy is tried at most once; rotating #pool proxies may be drawn again until
 // Retry.MaxAttempts proxies were used. For each proxy it tries the upstreams in
-// anonymousUpstreams order: the v1 lane (models.V1Base) before the v2
+// anonymousUpstreams order: the v1 lane (Upstream.Zen) before the v2
 // /inference upstream (Upstream.Anonymous). Any failure, including an HTTP
 // error response, advances to the next upstream or proxy; a proxy-route
 // failure, or a proxy marked unhealthy, skips that proxy's remaining
@@ -421,17 +421,25 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 }
 
 // anonymousUpstreams returns the ordered base URLs for the keyless free tier:
-// the v1 origin (models.V1Base) is tried first, and the configured v2
-// /inference origin (Upstream.Anonymous) is kept as a fallback. Only the v1
-// origin is returned when Upstream.Anonymous is empty or names that same
-// origin.
+// the configured v1 /zen origin (Upstream.Zen) is tried first, and the
+// configured v2 /inference origin (Upstream.Anonymous) is kept as a fallback.
+// Only the v1 origin is returned when Upstream.Anonymous is empty or names
+// that same origin.
+//
+// The v1 origin is Upstream.Zen rather than the models.V1Base constant so an
+// operator can point the anonymous lane at a reverse proxy (for example a
+// Resin route) and have the free-tier traffic actually go through it. Zen
+// defaults to models.V1Base, so an unconfigured gateway behaves as before.
 func (g *Gateway) anonymousUpstreams() []string {
-	v1 := strings.TrimRight(models.V1Base, "/")
-	primary := strings.TrimRight(g.cfg.Upstream.Anonymous, "/")
-	if primary == "" || strings.EqualFold(v1, primary) {
-		return []string{models.V1Base}
+	v1 := strings.TrimRight(strings.TrimSpace(g.cfg.Upstream.Zen), "/")
+	if v1 == "" {
+		v1 = strings.TrimRight(models.V1Base, "/")
 	}
-	return []string{models.V1Base, g.cfg.Upstream.Anonymous}
+	primary := strings.TrimRight(strings.TrimSpace(g.cfg.Upstream.Anonymous), "/")
+	if primary == "" || strings.EqualFold(v1, primary) {
+		return []string{v1}
+	}
+	return []string{v1, primary}
 }
 
 // inferenceClient picks the client of proxy for a request for model to

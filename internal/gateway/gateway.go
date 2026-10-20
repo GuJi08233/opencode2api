@@ -9,7 +9,8 @@
 // and, on the free tier, the single "read" tool. The v2 lane is the /inference
 // origin (upstream.anonymous) and the Go plan's /zen/go origin, which expect
 // the OpenCode 2.x CLI shape. The anonymous free tier tries the v1 origin
-// first and falls back to the configured v2 /inference origin.
+// (upstream.zen, so it can be pointed at a reverse proxy) first and falls back
+// to the configured v2 /inference origin.
 package gateway
 
 import (
