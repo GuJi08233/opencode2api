@@ -6,3 +6,7 @@ The OpenCode 2.1.4 system-prompt and tool-definition captures originate from
 that project and OpenCode. The FreeX MIT copyright and permission notice is
 preserved in LICENSES/OpenCode-Zen-FreeX-MIT.txt. The gateway remains licensed
 under GPL-3.0-or-later; the included MIT assets retain their original license.
+
+The Docker image includes the Bun runtime from oven-sh/bun, version 1.4.3.
+Its license and bundled third-party notices are preserved in
+LICENSES/Bun-LICENSE.md.
