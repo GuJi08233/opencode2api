@@ -21,6 +21,11 @@ import (
 
 func bunTestTransport(t *testing.T) *BunFetchTransport {
 	t.Helper()
+	// Bun gives lowercase proxy variables precedence on some platforms. Clear
+	// both spellings so a developer's environment cannot mask proxy behavior.
+	for _, name := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"} {
+		t.Setenv(name, "")
+	}
 	binary := os.Getenv("OPENCODE2API_BUN_BINARY")
 	if binary == "" || binary == "off" {
 		binary = "bun"
@@ -34,9 +39,9 @@ func bunTestTransport(t *testing.T) *BunFetchTransport {
 
 func TestBunFetchReverseProxyAndRequestBody(t *testing.T) {
 	transport := bunTestTransport(t)
-	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
-	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:1")
-	t.Setenv("ALL_PROXY", "http://127.0.0.1:1")
+	for _, name := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"} {
+		t.Setenv(name, "http://127.0.0.1:1")
+	}
 	body := `{"model":"test","messages":[],"stream":true}`
 	type receivedRequest struct{ path, body, agent string }
 	received := make(chan receivedRequest, 1)
@@ -210,6 +215,10 @@ func TestBunFetchDecodesCompression(t *testing.T) {
 func TestBunFetchExplicitForwardProxy(t *testing.T) {
 	transport := bunTestTransport(t)
 	t.Setenv("NO_PROXY", "*")
+	t.Setenv("no_proxy", "*")
+	for _, name := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"} {
+		t.Setenv(name, "http://127.0.0.1:1")
+	}
 	want := "http://origin.invalid/prefix/inference/v1/models"
 	received := make(chan string, 1)
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

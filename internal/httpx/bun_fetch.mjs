@@ -15,8 +15,7 @@ try {
     signal: controller.signal,
     redirect: "manual",
     // A configured direct route must not inherit the host's proxy environment.
-    proxy: input.proxy || false,
-    respectNoProxy: false,
+    proxy: input.proxy ? { url: input.proxy, respectNoProxy: false } : false,
   });
   clearTimeout(headerTimer);
   const headers = [];
