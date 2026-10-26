@@ -1,0 +1,8 @@
+This fork of opencode2api adapts the free-tier request format from
+OpenCode-Zen-FreeX, https://github.com/tkhs101/OpenCode-Zen-FreeX,
+version 0.5.9, commit f4f0af5.
+
+The OpenCode 2.1.4 system-prompt and tool-definition captures originate from
+that project and OpenCode. The FreeX MIT copyright and permission notice is
+preserved in LICENSES/OpenCode-Zen-FreeX-MIT.txt. The gateway remains licensed
+under GPL-3.0-or-later; the included MIT assets retain their original license.

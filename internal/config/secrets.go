@@ -56,9 +56,8 @@ func SecretRedactor() *Redactor {
 }
 
 // Replace loads the secrets of cfg: the server, Zen and Go keys, the WebUI
-// plaintext password, each upstream URL that carries userinfo (whole, plus its
-// username and password), and each entry of RuntimeProxies other than
-// "direct" (as written and as its clean URL, plus any username and password).
+// plaintext password, upstream userinfo, private reverse-proxy path prefixes
+// and query fields, and each entry of RuntimeProxies other than "direct".
 // Longer secrets are replaced first, so a secret that contains a shorter one
 // is scrubbed whole.
 func (r *Redactor) Replace(cfg Config) {
@@ -70,10 +69,37 @@ func (r *Redactor) Replace(cfg Config) {
 		values = append(values, cfg.WebUI.Password)
 	}
 	for _, value := range []string{cfg.Upstream.Zen, cfg.Upstream.Go, cfg.Upstream.Anonymous} {
-		if parsed, err := url.Parse(value); err == nil && parsed.User != nil {
+		parsed, err := url.Parse(value)
+		if err != nil {
+			continue
+		}
+		if parsed.User != nil {
 			values = append(values, value, parsed.User.Username())
 			if password, ok := parsed.User.Password(); ok {
 				values = append(values, password)
+			}
+		}
+		// net/http's url.Error includes the complete request URL. Register
+		// private Resin-style prefixes too, so error attributes are scrubbed
+		// even when their display URL was not explicitly sanitized first.
+		// Keep the host out of this set: manually masked routing evidence
+		// should still identify which proxy carried the request.
+		for _, path := range []string{parsed.Path, parsed.EscapedPath()} {
+			privateEnd := -1
+			for _, marker := range []string{"/https/", "/http/"} {
+				if index := strings.Index(path, marker); index >= 0 && (privateEnd < 0 || index < privateEnd) {
+					privateEnd = index
+				}
+			}
+			if privateEnd > 0 {
+				values = append(values, path[:privateEnd])
+			}
+		}
+		// Register complete query fields rather than a bare value such as
+		// "true", which could otherwise erase unrelated log messages.
+		for _, field := range strings.Split(parsed.RawQuery, "&") {
+			if strings.Contains(field, "=") {
+				values = append(values, field)
 			}
 		}
 	}

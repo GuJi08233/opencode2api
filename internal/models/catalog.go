@@ -613,8 +613,8 @@ func (c *ModelCatalog) supportedLocked(model string) bool {
 
 // tierSupportedLocked reports whether tier can carry model's protocol. A
 // configured override always can; otherwise the tier's capability data
-// decides, and a model it does not know is accepted only while the catalog is
-// pending.
+// decides. Newly listed -free models without protocol metadata use Chat, as
+// the provider does, while explicit unsupported declarations still win.
 func (c *ModelCatalog) tierSupportedLocked(model string, tier config.Tier) bool {
 	if c.protocols[model] != "" {
 		return true
@@ -625,9 +625,16 @@ func (c *ModelCatalog) tierSupportedLocked(model string, tier config.Tier) bool 
 	if c.nativeProtocols[tier][model] != "" {
 		return true
 	}
+	if hasFreeModelSuffix(model) && (tier == config.TierZen && c.zen[model] || tier == config.TierGo && c.goModels[model]) {
+		return true
+	}
 	// A pending catalog has no upstream capability snapshot to contradict a
 	// configured key, so retain the pre-refresh compatibility behavior.
 	return len(c.zen) == 0 && len(c.goModels) == 0
+}
+
+func hasFreeModelSuffix(model string) bool {
+	return strings.HasSuffix(strings.ToLower(model), "-free")
 }
 
 func toSet(items []string) map[string]bool {

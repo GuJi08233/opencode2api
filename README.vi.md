@@ -27,10 +27,10 @@ Xem [hướng dẫn bảng điều khiển quản trị (tiếng Trung)](docs/ma
 
 ## Bắt đầu nhanh
 
-Tải file nhị phân từ [GitHub Releases](https://github.com/jasonxu114514/opencode2api/releases), hoặc build với **Go 1.24 trở lên**:
+Tải file nhị phân từ [GitHub Releases](https://github.com/GuJi08233/opencode2api/releases), hoặc build với **Go 1.24 trở lên**:
 
 ```bash
-git clone https://github.com/jasonxu114514/opencode2api.git
+git clone https://github.com/GuJi08233/opencode2api.git
 cd opencode2api
 cp config.example.json config.json
 go build -o opencode2api ./cmd/opencode2api
@@ -62,7 +62,7 @@ Thư mục cấu hình phải ghi được để thực hiện việc chuyển m
 
 ## Docker
 
-Image được phát hành là `ghcr.io/jasonxu114514/opencode2api`.
+Image được phát hành là `ghcr.io/guji08233/opencode2api`.
 
 ```bash
 cp config.example.json config.json

@@ -346,12 +346,10 @@ func (g *Gateway) maxAnonymousExits() int {
 // doAnonymousUpstream walks the session's anonymous proxy cursor. Each static
 // proxy is tried at most once, up to performance.max_anonymous_exits proxies;
 // rotating #pool proxies may be drawn again until Retry.MaxAttempts proxies
-// were used. For each proxy it tries the upstreams in anonymousUpstreams
-// order: the configured v2 /inference upstream (Upstream.Anonymous) before the
-// v1 lane (models.V1Base). Any failure, including an HTTP error response,
-// advances to the next upstream or proxy; a proxy-route failure, or a proxy
-// marked unhealthy, skips that proxy's remaining upstreams. Only a successful
-// response ends the anonymous phase; exhausting the proxy cursor returns
+// were used. Each proxy sends to the configured 2.x /inference origin; the
+// retired 1.x /zen lane is never used as an anonymous fallback. A failed
+// attempt advances to another proxy. Only a successful response ends the
+// anonymous phase; exhausting the proxy cursor returns
 // control to the preferred authenticated tiers. It returns the last response
 // (body still open), else the last error, plus the number of attempts made.
 func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
@@ -448,6 +446,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			started := time.Now()
 			resp, err := doInferenceAttempt(g.inferenceClient(node.proxy, baseURL, route.ID), req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second, g.attemptTimeout)
 			duration := time.Since(started)
+			g.logInferenceAttempt(route, ids, attemptOffset+attempts, "anonymous", node.proxy, req, resp, err, duration)
 			if ctx.Err() != nil {
 				// The parent budget expired while this attempt was in flight. Its
 				// outcome says nothing about this proxy, so record nothing and stop
@@ -462,13 +461,13 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.proxy, resp, err, duration)
 			if err == nil && resp.StatusCode/100 == 2 {
 				g.observeAnonymousResult(ctx, node, resp, nil)
-				g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+				g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", redactInferenceURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 				return resp, nil, attempts
 			}
 			lastResponse = resp
 			lastErr = asProxyUnavailable(node.proxy, err)
 			if err != nil {
-				g.logger.Debug("anonymous transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds(), "error", err)
+				g.logger.Debug("anonymous transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", redactInferenceURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds(), "error", err)
 				if isProxyFailure(err) {
 					break
 				}
@@ -481,17 +480,17 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				node.proxy.markBlocked(time.Now().Add(g.freeTierBlockTTL()))
 				lastErr = errFreeTierIPBlocked
 				blocked = true
-				g.logger.Warn("free tier blocked the egress IP; cooling the exit", "component", "upstream", "event", "free_tier_ip_blocked", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "proxy", config.RedactURL(node.proxy.name), "block_for", g.freeTierBlockTTL().String())
+				g.logger.Warn("free tier blocked the egress IP; cooling the exit", "component", "upstream", "event", "free_tier_ip_blocked", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", redactInferenceURL(baseURL), "proxy", config.RedactURL(node.proxy.name), "block_for", g.freeTierBlockTTL().String())
 				break
 			} else if isDeterministicClientResponse(resp.StatusCode, peekResponseBody(resp)) {
 				// The request is too long, malformed, or otherwise invalid on
 				// every lane. Stop here and hand this 4xx to the client.
 				lastErr = errDeterministicClientRejection
 				halted = true
-				g.logger.Warn("upstream rejected the request; not trying other upstreams", "component", "upstream", "event", "deterministic_rejection", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+				g.logger.Warn("upstream rejected the request; not trying other upstreams", "component", "upstream", "event", "deterministic_rejection", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", redactInferenceURL(baseURL), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 				break
 			} else {
-				g.logger.Debug("anonymous upstream returned an error response; trying the next upstream or proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+				g.logger.Debug("anonymous upstream returned an error response; trying the next upstream or proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", redactInferenceURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 			}
 			if index+1 < len(upstreams) && !node.proxy.healthy.Load() {
 				break
@@ -550,17 +549,22 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	return nil, lastErr, attempts
 }
 
-// anonymousUpstreams returns the ordered base URLs for the keyless free tier:
-// the configured v2 /inference origin (Upstream.Anonymous) is tried first, and
-// the v1 origin (models.V1Base) is kept as a fallback. Only the v1 origin is
-// returned when Upstream.Anonymous is empty or names that same origin.
+// anonymousUpstreams returns the configured 2.x inference origin. FreeX no
+// longer retries the retired 1.x /zen lane. When loading an older configuration,
+// derive /inference from its Zen base so a reverse-proxy prefix is preserved.
 func (g *Gateway) anonymousUpstreams() []string {
-	v1 := strings.TrimRight(models.V1Base, "/")
-	primary := strings.TrimRight(g.cfg.Upstream.Anonymous, "/")
-	if primary == "" || strings.EqualFold(v1, primary) {
-		return []string{models.V1Base}
+	primary := strings.TrimRight(strings.TrimSpace(g.cfg.Upstream.Anonymous), "/")
+	if primary == "" {
+		primary = strings.TrimRight(strings.TrimSpace(g.cfg.Upstream.Zen), "/")
 	}
-	return []string{g.cfg.Upstream.Anonymous, models.V1Base}
+	if primary == "" {
+		primary = "https://opencode.ai/inference"
+	}
+	primary = strings.TrimSuffix(primary, "/v1")
+	if strings.HasSuffix(primary, "/zen") {
+		primary = strings.TrimSuffix(primary, "/zen") + "/inference"
+	}
+	return []string{primary}
 }
 
 // inferenceClient picks the client of proxy for a request for model to
@@ -603,11 +607,12 @@ func prepareAnonymousBody(body []byte, protocol wire.Protocol, v1 bool) ([]byte,
 	if ensureAnonymousChatUsage(payload, protocol) {
 		changed = true
 	}
-	if injectOfficialPrompt(payload, protocol, v1) {
-		changed = true
-	}
 	renames, toolsChanged := renameAndCompleteTools(payload, protocol, v1)
 	if toolsChanged {
+		changed = true
+	}
+	// The prompt names the host's actual callable clint_ tools, after rename.
+	if injectOfficialPrompt(payload, protocol, v1) {
 		changed = true
 	}
 	if !v1 && protocol == wire.Chat && ensureV2CompletionLimit(payload) {
@@ -859,6 +864,7 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 	if useWARP {
 		recordProxy = warpProxy(egress)
 	}
+	g.logInferenceAttempt(route, ids, attemptOffset+1, "key", recordProxy, req, resp, err, duration)
 	g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+1, keyID, "key", false, recordProxy, resp, err, duration)
 	if err != nil {
 		if useWARP {
@@ -978,6 +984,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			proxyLabel = config.RedactURL(proxy.name)
 			g.observeKeyResult(ctx, nodes, node, proxy, resp, err)
 		}
+		g.logInferenceAttempt(route, ids, attemptOffset+attempts, "key", recordProxy, req, resp, err, attemptDuration)
 		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, keyID, "key", false, recordProxy, resp, err, attemptDuration)
 		if err == nil && resp.StatusCode/100 == 2 {
 			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "proxy", proxyLabel, "status", resp.StatusCode, "duration_ms", attemptDuration.Milliseconds())
@@ -1143,19 +1150,62 @@ func (g *Gateway) recordUpstreamAttempt(ctx context.Context, route models.Route,
 	})
 }
 
+// redactInferenceURL keeps enough destination information to audit routing
+// without logging a reverse proxy's access-token prefix, userinfo or query.
+// It changes only a parsed copy used for display, never the request URL.
+func redactInferenceURL(raw string) string {
+	destination, err := url.Parse(raw)
+	if err != nil || destination.Host == "" {
+		return "<invalid>"
+	}
+	destination.RawQuery = ""
+	destination.ForceQuery = false
+	destination.Fragment = ""
+	privateEnd := -1
+	for _, marker := range []string{"/https/", "/http/"} {
+		if index := strings.Index(destination.Path, marker); index >= 0 && (privateEnd < 0 || index < privateEnd) {
+			privateEnd = index
+		}
+	}
+	if privateEnd >= 0 {
+		destination.Path = "/[redacted]" + destination.Path[privateEnd:]
+		destination.RawPath = ""
+	}
+	return config.RedactURL(destination.String())
+}
+
+// logInferenceAttempt records the actual request destination at info level so
+// an operator can distinguish a reverse-proxy request from a direct origin.
+// Bodies, authorization headers and raw transport errors are never logged.
+func (g *Gateway) logInferenceAttempt(route models.Route, ids identity.RequestIDs, attempt int, channel string, proxy *proxyTransport, req *http.Request, resp *http.Response, err error, duration time.Duration) {
+	proxyName := "unavailable"
+	if proxy != nil {
+		proxyName = config.RedactURL(proxy.name)
+	}
+	upstream := ""
+	if req != nil && req.URL != nil {
+		upstream = redactInferenceURL(req.URL.String())
+	}
+	g.logger.Info("upstream attempt completed", "component", "upstream", "event", "upstream_attempt", "request_id", ids.Request,
+		"model", route.ID, "attempt", attempt, "channel", channel, "upstream", upstream, "proxy", proxyName,
+		"status", upstreamStatus(resp), "duration_ms", duration.Milliseconds(), "transport_error", err != nil)
+}
+
 // upstreamRequest builds the POST for one attempt: baseURL plus the protocol's
-// /v1/... route, carrying body. The header set follows the lane: setV1Headers
-// when models.IsV1Upstream(baseURL), setV2Headers otherwise. Anthropic
-// endpoints on a v2 lane gain beta=true, matching the 2.x client; the 1.x lane
+// /v1/... route, carrying body. Public requests use the minimal FreeX 2.x
+// headers and per-request identities; keyed requests retain their lane's
+// header set. Anthropic endpoints on a v2 lane gain beta=true; the 1.x lane
 // keeps its shape. key is sent as x-api-key (with anthropic-version) on the
 // Anthropic protocol and as a Bearer token on every other one; the anonymous
 // lane passes anonymousZenKey.
 func upstreamRequest(ctx context.Context, baseURL string, protocol wire.Protocol, body []byte, ids identity.RequestIDs, key string) (*http.Request, error) {
+	anonymous := key == anonymousZenKey
+	v1 := !anonymous && models.IsV1Upstream(baseURL)
 	endpoint := strings.TrimRight(baseURL, "/") + wire.Path(protocol)
-	if !models.IsV1Upstream(baseURL) {
+	if !v1 {
 		endpoint = strings.TrimRight(baseURL, "/") + v2EndpointPath(baseURL, protocol)
 	}
-	if protocol == wire.Anthropic && !models.IsV1Upstream(baseURL) {
+	if protocol == wire.Anthropic && !v1 {
 		endpoint = withAnthropicBeta(endpoint)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
@@ -1163,7 +1213,11 @@ func upstreamRequest(ctx context.Context, baseURL string, protocol wire.Protocol
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if models.IsV1Upstream(baseURL) {
+	if anonymous {
+		// Keep the gateway's stable routing identity separate from the identity
+		// sent on the wire; probes and WARP use this same public request builder.
+		setFreeTierHeaders(req.Header, protocol, identity.FreeTierRequestIDs(ids))
+	} else if v1 {
 		setV1Headers(req.Header, protocol, body, ids)
 	} else {
 		setV2Headers(req.Header, protocol, ids)
@@ -1172,12 +1226,21 @@ func upstreamRequest(ctx context.Context, baseURL string, protocol wire.Protocol
 		req.Header.Set("x-api-key", key)
 		req.Header.Set("anthropic-version", "2023-06-01")
 	} else {
-		// The anonymous credential is the literal token "public". The 2026-10-14
-		// gate rejects keyless requests (an absent header used to pass) and is
-		// case-sensitive: "Bearer PUBLIC" 401s.
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
 	return req, nil
+}
+
+// setFreeTierHeaders matches FreeX's deliberately minimal OpenCode 2.x header
+// set. Extra affinity, parent, request-id and unsolicited beta headers are not
+// part of this public lane. Both OpenCode session headers identify one request.
+func setFreeTierHeaders(header http.Header, _ wire.Protocol, ids identity.RequestIDs) {
+	header.Set("Accept", "*/*")
+	header.Set("User-Agent", httpx.V2UserAgent())
+	header.Set("x-opencode-client", "cli")
+	header.Set("x-opencode-session", ids.Session)
+	header.Set("x-opencode-session-id", ids.Session)
+	header.Set("x-opencode-project", projectID(ids.Project))
 }
 
 // v2EndpointPath returns the route a 2.1 client posts to on a v2 origin. The

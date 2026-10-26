@@ -255,7 +255,7 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []strin
 		// The breaker is open, or its half-open probe is already running:
 		// refreshing now would only add to the block. Keeping nil leaves the
 		// previous catalog in place.
-		g.logger.Debug("anonymous model catalog refresh skipped; circuit breaker is not closed", "component", "models", "event", "anonymous_refresh_paused", "upstream", config.RedactURL(base))
+		g.logger.Debug("anonymous model catalog refresh skipped; circuit breaker is not closed", "component", "models", "event", "anonymous_refresh_paused", "upstream", redactInferenceURL(base))
 		return nil
 	}
 	defer g.anonymous.ReleaseProbe()
@@ -276,10 +276,10 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []strin
 		var models []string
 		var status int
 		var err error
-		// List models on the configured v2 /inference origin first, then fall
-		// back to the v1 origin (see anonymousUpstreams).
+		// List models on the configured v2 /inference origin through the same
+		// free-tier client used for inference, preserving its redirect policy.
 		for _, upstream := range g.anonymousUpstreams() {
-			models, status, err = modelcatalog.FetchModels(refreshCtx, node.proxy.client, upstream, anonymousZenKey)
+			models, status, err = modelcatalog.FetchModels(refreshCtx, node.proxy.bun, upstream, anonymousZenKey)
 			if err == nil || isProxyFailure(err) {
 				break
 			}
@@ -292,9 +292,9 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []strin
 			return models
 		}
 		g.anonymous.MarkFailure(node, nil, err)
-		g.logger.Debug("anonymous model catalog refresh attempt failed", "component", "models", "event", "anonymous_refresh_attempt_failed", "upstream", config.RedactURL(base), "attempt", attempt, "proxy", config.RedactURL(node.proxy.name), "error", err)
+		g.logger.Debug("anonymous model catalog refresh attempt failed", "component", "models", "event", "anonymous_refresh_attempt_failed", "upstream", redactInferenceURL(base), "attempt", attempt, "proxy", config.RedactURL(node.proxy.name), "error", err)
 	}
-	g.logger.Warn("anonymous model catalog refresh failed", "component", "models", "event", "anonymous_refresh_failed", "upstream", config.RedactURL(base))
+	g.logger.Warn("anonymous model catalog refresh failed", "component", "models", "event", "anonymous_refresh_failed", "upstream", redactInferenceURL(base))
 	return nil
 }
 
@@ -318,14 +318,14 @@ func (g *Gateway) refreshAnonymousWARP(ctx context.Context, base string) []strin
 		if err != nil {
 			lease.Release()
 			cancel()
-			g.logger.Warn("anonymous model catalog refresh could not use WARP", "component", "models", "event", "anonymous_refresh_failed", "upstream", config.RedactURL(base), "error", err)
+			g.logger.Warn("anonymous model catalog refresh could not use WARP", "component", "models", "event", "anonymous_refresh_failed", "upstream", redactInferenceURL(base), "error", err)
 			return nil
 		}
 		egress := "warp:" + lease.EgressKey()
 		var listed []string
 		var status int
 		for _, upstream := range g.anonymousUpstreams() {
-			listed, status, err = modelcatalog.FetchModels(refreshCtx, owned.regular, upstream, anonymousZenKey)
+			listed, status, err = modelcatalog.FetchModels(refreshCtx, owned.bun, upstream, anonymousZenKey)
 			if err == nil || isProxyFailure(err) {
 				break
 			}
@@ -339,9 +339,9 @@ func (g *Gateway) refreshAnonymousWARP(ctx context.Context, base string) []strin
 			g.anonymous.NoteSuccess()
 			return listed
 		}
-		g.logger.Debug("anonymous model catalog refresh attempt failed", "component", "models", "event", "anonymous_refresh_attempt_failed", "upstream", config.RedactURL(base), "attempt", attempt, "proxy", egress, "error", err)
+		g.logger.Debug("anonymous model catalog refresh attempt failed", "component", "models", "event", "anonymous_refresh_attempt_failed", "upstream", redactInferenceURL(base), "attempt", attempt, "proxy", egress, "error", err)
 	}
-	g.logger.Warn("anonymous model catalog refresh failed", "component", "models", "event", "anonymous_refresh_failed", "upstream", config.RedactURL(base))
+	g.logger.Warn("anonymous model catalog refresh failed", "component", "models", "event", "anonymous_refresh_failed", "upstream", redactInferenceURL(base))
 	return nil
 }
 
@@ -369,8 +369,8 @@ func (g *Gateway) refreshTier(ctx context.Context, base string, nodes *upstreamN
 			return models
 		}
 		nodes.MarkFailure(node, nil, err)
-		g.logger.Debug("model catalog refresh attempt failed", "component", "models", "event", "refresh_attempt_failed", "upstream", config.RedactURL(base), "attempt", attempt+1, "error", err)
+		g.logger.Debug("model catalog refresh attempt failed", "component", "models", "event", "refresh_attempt_failed", "upstream", redactInferenceURL(base), "attempt", attempt+1, "error", err)
 	}
-	g.logger.Warn("model catalog refresh failed", "component", "models", "event", "refresh_failed", "upstream", config.RedactURL(base))
+	g.logger.Warn("model catalog refresh failed", "component", "models", "event", "refresh_failed", "upstream", redactInferenceURL(base))
 	return nil
 }

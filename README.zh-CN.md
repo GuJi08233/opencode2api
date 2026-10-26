@@ -6,6 +6,9 @@
 
 WebUI 内嵌在可执行文件中，运行服务无需 Node.js 或数据库。
 
+本分支增加 OpenCode 2.1.4 / FreeX 请求兼容、Docker 原生 Bun 发包和 Resin
+反向代理配置支持，详见 [FreeX 与 Resin 集成说明](docs/freex-resin.zh-CN.md)。
+
 ## 功能
 
 - 三种推理协议之间的普通 JSON 响应与 SSE 流式转换。
@@ -25,10 +28,10 @@ WebUI 内嵌在可执行文件中，运行服务无需 Node.js 或数据库。
 
 ## 快速开始
 
-从 [GitHub Releases](https://github.com/jasonxu114514/opencode2api/releases) 下载可执行文件，或使用 **Go 1.24 及以上版本**编译：
+从 [GitHub Releases](https://github.com/GuJi08233/opencode2api/releases) 下载可执行文件，或使用 **Go 1.24 及以上版本**编译：
 
 ```bash
-git clone https://github.com/jasonxu114514/opencode2api.git
+git clone https://github.com/GuJi08233/opencode2api.git
 cd opencode2api
 cp config.example.json config.json
 go build -o opencode2api ./cmd/opencode2api
@@ -60,7 +63,7 @@ Windows 下使用 `Copy-Item config.example.json config.json` 复制配置，执
 
 ## Docker 部署
 
-已发布镜像：`ghcr.io/jasonxu114514/opencode2api`。
+已发布镜像：`ghcr.io/guji08233/opencode2api`。
 
 ```bash
 cp config.example.json config.json
@@ -293,7 +296,7 @@ Key 初始化时均衡分配到代理。真实流量可以触发代理检查、K
 | `prefer`                    | `go`；可选 `go`、`zen`。                                                              |
 | `upstream.zen`              | `https://opencode.ai/zen`。                                                           |
 | `upstream.go`               | `https://opencode.ai/zen/go`。                                                        |
-| `upstream.anonymous`        | `https://opencode.ai/inference`；匿名通道优先使用，失败后回退到 `/zen`。             |
+| `upstream.anonymous`        | `https://opencode.ai/inference`；匿名 2.x 通道，不再回退到旧 `/zen`。              |
 | `proxies`                   | 两个代理来源都为空时，使用 `["direct"]`。                                             |
 | `proxyfile`                 | 可选；相对路径基于配置文件所在目录解析。                                              |
 | `models.refresh_seconds`    | `300`；最小为 1。                                                                     |

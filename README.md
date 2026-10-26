@@ -6,6 +6,10 @@ A Go gateway for **OpenCode Zen and Zen Go**. It exposes Chat Completions, Respo
 
 The executable includes the WebUI. Running the service requires no Node.js runtime or database.
 
+This fork adds OpenCode 2.1.4 / FreeX request compatibility, native Bun fetch in
+Docker, and configurable Resin reverse-proxy upstreams. See the
+[FreeX and Resin integration guide (Chinese)](docs/freex-resin.zh-CN.md).
+
 ## Capabilities
 
 - JSON and SSE responses across all three inference protocols.
@@ -25,10 +29,10 @@ See the [management console guide (Chinese)](docs/management.zh-CN.md) for the n
 
 ## Quick start
 
-Download a binary from [GitHub Releases](https://github.com/jasonxu114514/opencode2api/releases), or build with **Go 1.24 or newer**:
+Download a binary from [GitHub Releases](https://github.com/GuJi08233/opencode2api/releases), or build with **Go 1.24 or newer**:
 
 ```bash
-git clone https://github.com/jasonxu114514/opencode2api.git
+git clone https://github.com/GuJi08233/opencode2api.git
 cd opencode2api
 cp config.example.json config.json
 go build -o opencode2api ./cmd/opencode2api
@@ -60,7 +64,7 @@ The configuration directory must be writable for password migration, configurati
 
 ## Docker
 
-The published image is `ghcr.io/jasonxu114514/opencode2api`.
+The published image is `ghcr.io/guji08233/opencode2api`.
 
 ```bash
 cp config.example.json config.json
@@ -293,7 +297,7 @@ See [config.example.json](config.example.json) for a complete starting configura
 | `prefer`                    | `go`; accepts `go` or `zen`.                                                |
 | `upstream.zen`              | `https://opencode.ai/zen`.                                                  |
 | `upstream.go`               | `https://opencode.ai/zen/go`.                                               |
-| `upstream.anonymous`        | `https://opencode.ai/inference`; tried first by the anonymous lane, which falls back to `/zen`. |
+| `upstream.anonymous`        | `https://opencode.ai/inference`; the anonymous 2.x origin, without a legacy `/zen` fallback. |
 | `proxies`                   | Falls back to `["direct"]` when both proxy sources are empty.               |
 | `proxyfile`                 | Optional; relative paths resolve beside the configuration file.             |
 | `models.refresh_seconds`    | `300`; minimum 1.                                                           |

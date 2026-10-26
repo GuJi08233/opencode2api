@@ -430,13 +430,25 @@ func (p *proxyTransports) healthCounts() (total, healthy int) {
 	return len(p.items), healthy
 }
 
-// transportPool builds the HTTP clients of every configured proxy entry, each
-// entry starting healthy: a regular client and a Bun-disguised one
-// (httpx.BunTransport) sharing the proxy, connect timeout, idle settings and
-// responseHeaderTimeout as their header wait. A #pool entry gets HTTP/1.1
-// transports without keep-alives, so every attempt opens a new connection
-// through the pool; "direct" dials the upstream without any proxy, ignoring
-// the proxy environment variables.
+// freeTierHTTPClient keeps an upstream redirect visible to the caller. A
+// reverse proxy can return an absolute Location for the origin it proxies;
+// following it here would bypass that configured route and send credentials
+// to an address outside the operator's selected upstream.
+func freeTierHTTPClient(transport http.RoundTripper) *http.Client {
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// transportPool builds a regular client and a free-tier client for each
+// configured proxy route, starting healthy. Free-tier traffic uses native Bun
+// fetch when installed and the compatible Go transport otherwise. Both honor
+// the configured route; "direct" ignores the proxy environment. Native Bun
+// owns a process per attempt; the Go fallback disables connection reuse for
+// #pool routes, so a rotating pool supplies a fresh exit on every attempt.
 func transportPool(proxies []string, cfg config.PerformanceConfig, responseHeaderTimeout time.Duration) (*proxyTransports, error) {
 	p := &proxyTransports{items: make([]*proxyTransport, 0, len(proxies))}
 	for _, raw := range proxies {
@@ -479,7 +491,7 @@ func transportPool(proxies []string, cfg config.PerformanceConfig, responseHeade
 			transport.Proxy = http.ProxyURL(u)
 			proxyURL = u
 		}
-		bun, err := httpx.NewBunTransport(httpx.BunOptions{
+		bun, err := httpx.NewFreeTierTransport(httpx.BunOptions{
 			Proxy:                 proxyURL,
 			ConnectTimeout:        time.Duration(cfg.ConnectTimeoutSeconds) * time.Second,
 			ResponseHeaderTimeout: responseHeaderTimeout,
@@ -490,7 +502,7 @@ func transportPool(proxies []string, cfg config.PerformanceConfig, responseHeade
 		if err != nil {
 			return nil, fmt.Errorf("proxy %s: %w", config.RedactURL(raw), err)
 		}
-		proxy := &proxyTransport{index: len(p.items), name: raw, pool: isPool, client: &http.Client{Transport: transport}, bun: &http.Client{Transport: bun}}
+		proxy := &proxyTransport{index: len(p.items), name: raw, pool: isPool, client: &http.Client{Transport: transport}, bun: freeTierHTTPClient(bun)}
 		proxy.healthy.Store(true)
 		p.items = append(p.items, proxy)
 	}

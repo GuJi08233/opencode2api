@@ -273,6 +273,7 @@ const DICTIONARY = {
       "config.warp.source.hint":
         "Used only with the IPv6 network stack. Every WARP exit binds one source address from this prefix, so replacing an exit also replaces its public egress; leave empty to share this host's default source address.",
       "config.upstream.title": "Upstream and protocol routing",
+      "config.upstream.anonymous": "Anonymous free-model URL",
       "config.upstream.caption":
         "anonymous will use every available proxy; an explicit protocol mapping wins over inferring the protocol from the model name.",
       "config.upstream.freeOnly": "Only expose free models (even when Zen / Go Keys are configured)",
@@ -832,6 +833,7 @@ const DICTIONARY = {
       "config.warp.source.hint":
         "Chỉ dùng với ngăn xếp mạng IPv6. Mỗi đầu ra WARP gắn một địa chỉ nguồn trong tiền tố này, nên khi thay đầu ra là thay luôn địa chỉ công cộng; để trống sẽ dùng địa chỉ nguồn mặc định của máy chủ.",
       "config.upstream.title": "Upstream và định tuyến giao thức",
+      "config.upstream.anonymous": "URL mô hình miễn phí ẩn danh",
       "config.upstream.caption":
         "anonymous sẽ dùng hết các Proxy khả dụng; ánh xạ protocol tường minh được ưu tiên hơn việc suy luận từ tên mô hình.",
       "config.upstream.freeOnly": "Chỉ công khai mô hình miễn phí (kể cả khi đã cấu hình Zen / Go Key)",
@@ -1402,6 +1404,7 @@ const DICTIONARY = {
       "config.warp.source.hint":
         "Usato solo con lo stack IPv6. Ogni uscita WARP associa un indirizzo sorgente da questo prefisso, quindi sostituire un'uscita sostituisce anche l'indirizzo pubblico; lascia vuoto per usare l'indirizzo sorgente predefinito dell'host.",
       "config.upstream.title": "Upstream e instradamento protocolli",
+      "config.upstream.anonymous": "URL dei modelli gratuiti anonimi",
       "config.upstream.caption":
         "anonymous userà ogni proxy disponibile; una mappatura esplicita di protocollo prevale sull'inferenza del protocollo dal nome del modello.",
       "config.upstream.freeOnly":

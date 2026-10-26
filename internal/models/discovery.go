@@ -22,12 +22,12 @@ import (
 // FetchProtocolDocs.
 const (
 	CapabilitiesURL = "https://models.opencode.ai/api.json"
-	ZenDocsURL      = "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/zen.mdx"
+	ZenDocsURL      = "https://raw.githubusercontent.com/anomalyco/opencode/dev/services/www/src/docs/content/console/models.mdx"
 	GoDocsURL       = "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/go.mdx"
 	// V1Base is the v1 lane's origin: the /zen console (serving /zen/v1/*) that
 	// expects the OpenCode 1.x request shape. It is the default keyed Zen
-	// upstream and the anonymous lane's fallback after the v2 /inference
-	// origin. It also serves the models listing.
+	// upstream. Anonymous free requests use the v2 /inference origin instead.
+	// It also serves the keyed Zen models listing.
 	V1Base = "https://opencode.ai/zen"
 )
 
@@ -182,6 +182,15 @@ func FetchCapabilities(ctx context.Context, client *http.Client, endpoint string
 				npm = model.Provider.NPM
 			}
 			if protocol, ok := protocolForSDK(npm); ok {
+				result.Protocols[tier][modelID] = protocol
+			} else if hasFreeModelSuffix(modelID) {
+				// A newly listed free model can precede its SDK metadata. Like
+				// FreeX, retain the provider's supported default, or Chat, until
+				// its published endpoint supplies a more specific protocol.
+				protocol, ok := protocolForSDK(provider.NPM)
+				if !ok {
+					protocol = wire.Chat
+				}
 				result.Protocols[tier][modelID] = protocol
 			} else {
 				result.Unsupported[tier][modelID] = true

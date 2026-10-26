@@ -100,7 +100,7 @@ func (g *Gateway) newWarpLease(lease *warp.Lease, useBun bool) (*warpLease, erro
 		lease:   lease,
 		pool:    g.warp,
 		regular: &http.Client{Transport: transport},
-		bun:     &http.Client{Transport: bun},
+		bun:     freeTierHTTPClient(bun),
 		useBun:  useBun,
 	}, nil
 }
@@ -280,6 +280,7 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 			started := time.Now()
 			resp, egress, err := g.doWARPAttempt(ctx, req, baseURL, route.ID, firstEventTimeout)
 			duration := time.Since(started)
+			g.logInferenceAttempt(route, ids, attemptOffset+attempts, "anonymous", warpProxy(egress), req, resp, err, duration)
 			if ctx.Err() != nil {
 				lastResponse, lastErr = resp, err
 				if lastErr == nil && lastResponse == nil {
@@ -291,12 +292,12 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 			g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, warpProxy(egress), resp, err, duration)
 			if err == nil && status/100 == 2 {
 				g.anonymous.NoteSuccess()
-				g.logger.Debug("anonymous WARP upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", egress, "status", status, "duration_ms", duration.Milliseconds())
+				g.logger.Debug("anonymous WARP upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", redactInferenceURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", egress, "status", status, "duration_ms", duration.Milliseconds())
 				return resp, nil, attempts
 			}
 			lastResponse, lastErr = resp, err
 			if err != nil {
-				g.logger.Debug("anonymous WARP transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", egress, "duration_ms", duration.Milliseconds(), "error", err)
+				g.logger.Debug("anonymous WARP transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", redactInferenceURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", egress, "duration_ms", duration.Milliseconds(), "error", err)
 				// A broken tunnel affects both upstream gates; rotate the exit
 				// instead of repeating the request on the same lease.
 				break
@@ -304,16 +305,16 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 			if peekNetworkAbuseBlock(resp) {
 				lastErr = errFreeTierIPBlocked
 				blocked, leaseBlocked = true, true
-				g.logger.Warn("free tier blocked the WARP exit; rotating it", "component", "upstream", "event", "free_tier_ip_blocked", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "proxy", egress)
+				g.logger.Warn("free tier blocked the WARP exit; rotating it", "component", "upstream", "event", "free_tier_ip_blocked", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", redactInferenceURL(baseURL), "proxy", egress)
 				break
 			}
 			if isDeterministicClientResponse(status, peekResponseBody(resp)) {
 				lastErr = errDeterministicClientRejection
 				halted = true
-				g.logger.Warn("upstream rejected the request; not trying other upstreams", "component", "upstream", "event", "deterministic_rejection", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "status", status, "duration_ms", duration.Milliseconds())
+				g.logger.Warn("upstream rejected the request; not trying other upstreams", "component", "upstream", "event", "deterministic_rejection", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", redactInferenceURL(baseURL), "status", status, "duration_ms", duration.Milliseconds())
 				break
 			}
-			g.logger.Debug("anonymous WARP upstream returned an error response; trying the next upstream or exit", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", egress, "status", status, "duration_ms", duration.Milliseconds())
+			g.logger.Debug("anonymous WARP upstream returned an error response; trying the next upstream or exit", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", redactInferenceURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", egress, "status", status, "duration_ms", duration.Milliseconds())
 			if index+1 < len(upstreams) {
 				break
 			}

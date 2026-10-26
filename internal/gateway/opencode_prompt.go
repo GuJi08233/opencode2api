@@ -9,14 +9,15 @@ import (
 	"sync"
 	"time"
 
+	"opencode2api/internal/jsonutil"
 	wire "opencode2api/internal/protocol"
 )
 
 // The free tier accepts only agent-shaped requests, and its abuse checks expect
 // the system prompt the official CLI sends. These assets are the CLI's own
-// wording: the v1 text for /zen (OpenCode 1.x tool names) and the v2 text for
-// /inference and /zen/go (OpenCode 2.x tool names). The v2 file is the v1 file
-// with the tool names the 2.x CLI uses.
+// wording: the legacy v1 text for keyed /zen and an independent OpenCode
+// 2.1.4 capture for /inference and /zen/go. The v2 asset is shared with FreeX;
+// it is not a rewrite of the older prompt.
 //
 //go:embed opencode_prompt_v1.txt
 var opencodePromptV1 string
@@ -27,18 +28,7 @@ var opencodePromptV2 string
 // opencodePromptMarker identifies a body that already carries the official CLI
 // system prompt, so a client that sends it itself is left alone.
 const opencodePromptMarker = "You are opencode, an interactive CLI tool"
-
-// opencodeSkills is the built-in skill listing the CLI appends after its
-// environment block. It is static, so it is part of the injected prompt.
-const opencodeSkills = `Skills provide specialized instructions and workflows for specific tasks.
-Use the skill tool to load a skill when a task matches its description.
-<available_skills>
-  <skill>
-    <name>customize-opencode</name>
-    <description>Use ONLY when the user is editing or creating opencode's own configuration: opencode.json, opencode.jsonc, files under .opencode/, or files under ~/.config/opencode/. Also use when creating or fixing opencode agents, subagents, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring opencode itself.</description>
-    <location>&lt;built-in&gt;</location>
-  </skill>
-</available_skills>`
+const opencodePromptMarkerV2 = "You are an AI agent running in OpenCode"
 
 var (
 	opencodeEnvOnce sync.Once
@@ -80,14 +70,76 @@ func opencodeEnvironment(model string) string {
 	}, "\n")
 }
 
-// opencodeSystemPrompt assembles the full CLI system prompt for model and the
-// upstream generation's tool naming.
-func opencodeSystemPrompt(model string, v1 bool) string {
-	base := opencodePromptV2
-	if v1 {
-		base = opencodePromptV1
+// opencodeEnvironmentV2 renders the environment block captured from 2.1.4.
+// The current date is part of the template, above this block.
+func opencodeEnvironmentV2(model string) string {
+	_ = opencodeEnvironment(model) // Resolve the process directory once.
+	platform := runtime.GOOS
+	if platform == "windows" {
+		platform = "win32"
 	}
-	return base + opencodeEnvironment(model) + "\n" + opencodeSkills
+	return strings.Join([]string{
+		"<env>",
+		"  Working directory: " + opencodeWorkDir,
+		"  Workspace root folder: " + opencodeWorkDir,
+		"  Is directory a git repo: yes",
+		"  Platform: " + platform,
+		"  Prefer " + filepath.Join(os.TempDir(), "opencode") + " over generic system temporary directories such as /tmp; it is pre-created and approved for external access.",
+		"</env>",
+	}, "\n")
+}
+
+// opencodeSystemPrompt assembles the independent capture for each generation.
+// A gateway does not advertise OpenCode's built-in skills, which it cannot run.
+func opencodeSystemPrompt(model string, v1 bool) string {
+	if v1 {
+		return opencodePromptV1 + opencodeEnvironment(model)
+	}
+	model = strings.TrimSpace(strings.TrimPrefix(model, "opencode/"))
+	if model == "" {
+		model = "unknown"
+	}
+	parts := strings.Split(model, "-")
+	for i, part := range parts {
+		if part != "" {
+			parts[i] = strings.ToUpper(part[:1]) + part[1:]
+		}
+	}
+	return strings.NewReplacer(
+		"{{MODEL_NAME}}", strings.Join(parts, " "),
+		"{{MODEL_ID}}", model,
+		"{{DATE}}", time.Now().UTC().Format("Mon Jan 02 2006"),
+		"{{ENV}}", opencodeEnvironmentV2(model),
+	).Replace(opencodePromptV2)
+}
+
+// hostToolAvailability names the tools the caller actually implements. The
+// captured Code Mode prompt otherwise leads the model to call OpenCode's
+// execute tool, which the gateway merely advertises as part of the wire shape.
+func hostToolAvailability(payload map[string]any) string {
+	var names []string
+	seen := map[string]bool{}
+	for _, raw := range jsonutil.SliceAt(payload, "tools") {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := jsonutil.FirstString(jsonutil.StringAt(tool, "function", "name"), jsonutil.StringAt(tool, "name"))
+		if strings.HasPrefix(name, wire.ClientToolPrefix) && !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	callable := "This host implements no tools at all; answer without tool calls."
+	if len(names) > 0 {
+		callable = "The tools you can call are the host's own, under their " + wire.ClientToolPrefix + " names: " + strings.Join(names, ", ") + "."
+	}
+	return strings.Join([]string{
+		"<system-reminder>",
+		"Code Mode is not active in this session: this host is not OpenCode, and the built-in tools described above - `execute` and every entry of the catalog - are not implemented here. A call to one is answered with an unknown-tool error and nothing else.",
+		callable + " Every other entry in the tools array is an OpenCode built-in nothing here runs: read that array as the host's own list, not as OpenCode's.",
+		"</system-reminder>",
+	}, "\n")
 }
 
 // injectOfficialPrompt prepends the official CLI system prompt to a shaped
@@ -100,7 +152,7 @@ func injectOfficialPrompt(payload map[string]any, protocol wire.Protocol, v1 boo
 		return false
 	}
 	model, _ := payload["model"].(string)
-	prompt := opencodeSystemPrompt(model, v1)
+	prompt := opencodeSystemPrompt(model, v1) + "\n\n" + hostToolAvailability(payload)
 	switch protocol {
 	case wire.Chat:
 		return injectChatPrompt(payload, prompt)
@@ -226,7 +278,7 @@ func textFragments(value any) []string {
 // the marker.
 func carriesOpenCodePrompt(value any) bool {
 	for _, part := range textFragments(value) {
-		if strings.Contains(part, opencodePromptMarker) {
+		if strings.Contains(part, opencodePromptMarker) || strings.Contains(part, opencodePromptMarkerV2) {
 			return true
 		}
 	}

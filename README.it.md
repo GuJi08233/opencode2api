@@ -25,10 +25,10 @@ Consulta la [guida della console di gestione (in cinese)](docs/management.zh-CN.
 
 ## Avvio rapido
 
-Scarica un binario da [GitHub Releases](https://github.com/jasonxu114514/opencode2api/releases) oppure compila con **Go 1.24 o superiore**:
+Scarica un binario da [GitHub Releases](https://github.com/GuJi08233/opencode2api/releases) oppure compila con **Go 1.24 o superiore**:
 
 ```bash
-git clone https://github.com/jasonxu114514/opencode2api.git
+git clone https://github.com/GuJi08233/opencode2api.git
 cd opencode2api
 cp config.example.json config.json
 go build -o opencode2api ./cmd/opencode2api
@@ -60,7 +60,7 @@ La directory di configurazione deve essere scrivibile per migrare la password, s
 
 ## Docker
 
-L'immagine pubblicata è `ghcr.io/jasonxu114514/opencode2api`.
+L'immagine pubblicata è `ghcr.io/guji08233/opencode2api`.
 
 ```bash
 cp config.example.json config.json

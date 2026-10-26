@@ -11,3 +11,6 @@
 !docker-entrypoint.sh
 !Dockerfile
 !LICENSE
+!NOTICE
+!LICENSES/
+!LICENSES/**

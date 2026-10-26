@@ -33,8 +33,7 @@ type opencodeToolDefinition struct {
 // because Go maps do not preserve it. Tool order is not validated upstream, but
 // keeping the captured order makes the wire body stable.
 var v2OfficialToolOrder = []string{
-	"edit", "execute", "glob", "grep", "question", "read", "shell",
-	"skill", "subagent", "webfetch", "websearch", "write", "patch",
+	"edit", "glob", "grep", "question", "read", "shell", "skill", "subagent", "webfetch", "websearch", "write", "execute",
 }
 
 var (
@@ -155,13 +154,13 @@ func officialToolset(protocol wire.Protocol, v1 bool) []any {
 }
 
 // v2ShellDescription renders the shell tool description for the host platform.
-// The 2.x client describes the shell it actually has, so a Windows host says
-// powershell where a Unix host says bash.
+// The 2.1.4 client describes bash on both platforms; only the platform name
+// changes on Windows.
 func v2ShellDescription(base string) string {
 	if runtime.GOOS != "windows" {
 		return base
 	}
-	return strings.Replace(base, "on Linux using bash", "on Windows using powershell", 1)
+	return strings.Replace(base, "on Linux using bash", "on Windows using bash", 1)
 }
 
 // v1BashDescription applies the same platform rewrite to the 1.x bash
@@ -211,6 +210,13 @@ func renameAndCompleteTools(payload map[string]any, protocol wire.Protocol, v1 b
 		}
 		if wireName := clientWireName(renames, used, name); wireName != name {
 			setToolName(protocol, entry, wireName)
+		}
+		if !v1 && protocol == wire.Chat {
+			if function, ok := entry["function"].(map[string]any); ok {
+				if _, exists := function["strict"]; !exists {
+					function["strict"] = false
+				}
+			}
 		}
 		shaped = append(shaped, entry)
 	}

@@ -15,15 +15,20 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
+	"os"
 	"regexp"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"opencode2api/internal/jsonutil"
 )
 
-// RequestIDs carries the identity headers the upstream free tier inspects.
+// RequestIDs carries stable gateway identities and prepared free-tier values.
 // Session is the conversation-affinity key sent as x-opencode-session; the
 // v2 lane sends ChildSession, the client's own x-opencode-session-id, as
 // x-opencode-session-id so a subagent keeps its child id while affinity stays
@@ -38,6 +43,16 @@ type RequestIDs struct {
 	Message       string
 	Project       string
 	ParentSession string
+
+	// FreeTierSession and FreeTierProject are minted once per incoming request.
+	// They keep anonymous retries on one outbound identity without changing the
+	// stable identities used for gateway routing and telemetry.
+	FreeTierSession string
+	FreeTierProject string
+
+	// ProjectProvided distinguishes a caller's project from the stable default
+	// the gateway uses internally when no project was named.
+	ProjectProvided bool
 }
 
 // DeriveRequestIDs derives the upstream identity of one request. scope names
@@ -78,6 +93,8 @@ func DeriveRequestIDs(r *http.Request, body map[string]any, scope string) Reques
 		childSession = scopedSessionID(scope, childSession)
 	}
 	projectSignal := jsonutil.FirstString(r.Header.Get("x-opencode-project"), jsonutil.StringAt(body, "metadata", "project_id"))
+	projectProvided := projectSignal != ""
+	freeProject := projectSignal
 	if projectSignal == "" {
 		// Without a client project every caller would otherwise share one
 		// constant upstream project.
@@ -85,6 +102,7 @@ func DeriveRequestIDs(r *http.Request, body map[string]any, scope string) Reques
 		if scope != "" {
 			projectSignal += ":" + scope
 		}
+		freeProject = randomProjectID()
 	}
 	parentSession := jsonutil.FirstString(
 		r.Header.Get("x-parent-session-id"),
@@ -94,13 +112,96 @@ func DeriveRequestIDs(r *http.Request, body map[string]any, scope string) Reques
 		parentSession = scopedSessionID(scope, parentSession)
 	}
 	return RequestIDs{
-		Session:       session,
-		ChildSession:  childSession,
-		Request:       RandomID("req", 16),
-		Message:       UserMessageID(r, body, session),
-		Project:       projectSignal,
-		ParentSession: parentSession,
+		Session:         session,
+		ChildSession:    childSession,
+		Request:         RandomID("req", 16),
+		Message:         UserMessageID(r, body, session),
+		Project:         projectSignal,
+		ParentSession:   parentSession,
+		FreeTierSession: freshSessionID(time.Now()),
+		FreeTierProject: freeProject,
+		ProjectProvided: projectProvided,
 	}
+}
+
+// FreeTierRequestIDs returns the anonymous upstream identity for an incoming
+// request. The default matches FreeX: a fresh current-time session, the same
+// value in both session headers, and a private random project when the caller
+// supplied none. DeriveRequestIDs has already minted these values, so retrying
+// that request reuses them. The original stable gateway identities are left
+// untouched. Manually constructed IDs, such as availability probes, are filled
+// here instead.
+//
+// OPENCODE_ZEN_FREE_SESSION_AFFINITY=1 keeps the gateway's conversation session
+// for callers that prefer upstream session affinity. It does not turn an
+// unnamed project back into the shared internal default.
+func FreeTierRequestIDs(ids RequestIDs) RequestIDs {
+	if ids.FreeTierSession == "" {
+		ids.FreeTierSession = freshSessionID(time.Now())
+	}
+	if ids.FreeTierProject == "" {
+		if ids.Project != "" && (ids.ProjectProvided || !strings.HasPrefix(ids.Project, "opencode2api:default-project")) {
+			ids.FreeTierProject = ids.Project
+		} else {
+			ids.FreeTierProject = randomProjectID()
+		}
+	}
+	if os.Getenv("OPENCODE_ZEN_FREE_SESSION_AFFINITY") != "1" || ids.Session == "" {
+		ids.Session = ids.FreeTierSession
+	}
+	ids.ChildSession = ids.Session
+	ids.ParentSession = ""
+	ids.Project = ids.FreeTierProject
+	return ids
+}
+
+var freeTierClock struct {
+	sync.Mutex
+	stamp   int64
+	counter uint16
+}
+
+var freeTierEntropySequence atomic.Uint64
+
+// freshSessionID follows OpenCode's descending identifier layout: the low
+// 36 bits of the current millisecond timestamp, a small per-millisecond
+// counter, and fourteen random Base62 characters. The counter wraps inside
+// 1..15 as FreeX does; uniqueness comes from the random tail.
+func freshSessionID(now time.Time) string {
+	stamp := now.UnixMilli()
+	freeTierClock.Lock()
+	if freeTierClock.stamp != stamp {
+		freeTierClock.stamp, freeTierClock.counter = stamp, 0
+	}
+	freeTierClock.counter = freeTierClock.counter%15 + 1
+	counter := freeTierClock.counter
+	freeTierClock.Unlock()
+	value := ^(uint64(stamp)<<12 | uint64(counter)) & 0xffffffffffff
+	tail := freeTierRandomBytes(14)
+	for i := range tail {
+		tail[i] = base62Alphabet[int(tail[i])%len(base62Alphabet)]
+	}
+	return fmt.Sprintf("ses_%012x%s", value, tail)
+}
+
+func randomProjectID() string {
+	return hex.EncodeToString(freeTierRandomBytes(20))
+}
+
+// Identity entropy is not a credential. If the system entropy reader fails,
+// keep the gateway available with process-local unique, time-mixed bytes
+// rather than giving unrelated requests one constant identity.
+func freeTierRandomBytes(size int) []byte {
+	value := make([]byte, size)
+	if _, err := io.ReadFull(rand.Reader, value); err == nil {
+		return value
+	}
+	for offset := 0; offset < len(value); {
+		seed := fmt.Sprintf("free-tier\x00%d\x00%d\x00%d", time.Now().UnixNano(), os.Getpid(), freeTierEntropySequence.Add(1))
+		sum := sha256.Sum256([]byte(seed))
+		offset += copy(value[offset:], sum[:])
+	}
+	return value
 }
 
 // scopedSessionID keeps an official client-minted session verbatim and

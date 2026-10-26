@@ -120,18 +120,17 @@ func (w *WarpConfig) Normalize() error {
 // picks the request shape from the base URL (models.IsV1Upstream): one ending
 // in /zen is the v1 lane, any other a v2 lane.
 type UpstreamConfig struct {
-	// Zen is the base URL of the keyed Zen tier. Its default,
-	// https://opencode.ai/zen, is the v1 lane, which expects the OpenCode 1.x
-	// client request shape.
+	// Zen is the base URL of the keyed Zen tier.
+	// Its default, https://opencode.ai/zen, is the v1 lane, which expects the
+	// OpenCode 1.x client request shape.
 	Zen string `json:"zen"`
 	// Go is the base URL of the keyed Go plan tier. Its default,
 	// https://opencode.ai/zen/go, is a v2 lane, which expects the OpenCode 2.x
 	// CLI shape. The WebUI also reads the plan's quota from its /v1/usage.
 	Go string `json:"go"`
 	// Anonymous is the v2 /inference origin of the keyless free tier. The
-	// anonymous lane tries this origin first and falls back to the v1 /zen
-	// origin (models.V1Base, not Zen), which is the only upstream used when
-	// this one equals the v1 origin. Empty means https://opencode.ai/inference.
+	// anonymous lane uses this origin without retrying the retired v1 /zen
+	// free lane. Empty means https://opencode.ai/inference.
 	Anonymous string `json:"anonymous"`
 }
 

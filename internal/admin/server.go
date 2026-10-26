@@ -211,7 +211,7 @@ func (a *Server) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 
 // handlePutConfig resolves the submitted secrets against the current ones,
 // keeps what the update omits (rotation, server key metadata, the WebUI
-// username and password hash, and reasoning when the field is absent), and
+// username and password hash, the anonymous upstream, and reasoning), and
 // hands the result to the runtime, which validates, applies and persists it.
 func (a *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	var update ConfigUpdate
@@ -243,6 +243,11 @@ func (a *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	reasoning := current.Reasoning
 	if update.Reasoning != nil {
 		reasoning = *update.Reasoning
+	}
+	// Older configuration forms submit only the keyed upstream URLs. Keep
+	// the anonymous route rather than resetting it to the public origin.
+	if strings.TrimSpace(update.Upstream.Anonymous) == "" {
+		update.Upstream.Anonymous = current.Upstream.Anonymous
 	}
 	candidate := config.Config{
 		ServerKeyMetadata: current.ServerKeyMetadata,
